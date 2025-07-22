@@ -1,10 +1,10 @@
 # DataGraphGenerator: Custom Distance Graph Library
 
-A Python library for creating and refining sparse graph representations of data according to custom distance functions.
+A Python library for creating and refining sparse graph representations of data according to custom semimetric weighting functions.
 
 ## Overview
 
-DataGraphGenerator builds data-driven graphs where edges represent meaningful relationships between data points. It uses custom distance metrics to weight edges and applies graph refinement techniques to produce high-quality sparse graph representations.
+DataGraphGenerator builds data-driven graphs where edges represent meaningful relationships between data points. It uses custom weight edges and applies graph refinement techniques to produce high-quality sparse graph representations.
 
 ## Key Features
 
