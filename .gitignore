@@ -1,0 +1,15 @@
+# Byte‑compiled / caching
+__pycache__/
+*.py[cod]
+
+# Build / packaging
+*.egg-info/
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Optional: virtualenvs
+.env/
+venv/
