@@ -154,7 +154,3 @@ graph_obj, results = generator.build_and_refine_graph(
     max_new_edges=None           # No limit on 2-hop connections
 )
 ```
-
-## License
-
-[Your license information here]
