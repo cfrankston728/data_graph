@@ -52,7 +52,7 @@ class DataGraphGenerator:
                  use_float32=True,
                  n_jobs=-1, 
                  plot_knee=False,
-                 default_missing_value=np.inf,  # NEW: configurable missing value
+                 missing_weight=np.inf,  # NEW: configurable missing value
                  use_euclidean_as_graph_distance=False):  # NEW: optimization flag
         """
         Graph generator for a custom distance graph over data
@@ -67,7 +67,7 @@ class DataGraphGenerator:
             Number of parallel jobs for parallel operations
         plot_knee : bool, default=False
             Whether to generate a plot of the knee point detection
-        default_missing_value : float, default=np.inf
+        missing_weight : float, default=np.inf
             Value returned by semimetric function to indicate missing/invalid edge
         use_euclidean_as_graph_distance : bool, default=False
             If True, skip graph distance computation and use Euclidean distances directly.
@@ -79,7 +79,7 @@ class DataGraphGenerator:
         self.n_jobs = n_jobs
         self.plot_knee = plot_knee
         self.timing = TimingStats()  # Initialize timing stats
-        self.default_missing_value = default_missing_value
+        self.missing_weight = missing_weight
         self.use_euclidean_as_graph_distance = use_euclidean_as_graph_distance
 
         self.node_df = node_df
@@ -587,7 +587,7 @@ class DataGraphGenerator:
                     
                     # NEW: Check for missing values and mark invalid edges
                     for i, (dist, idx) in enumerate(zip(batch_distances, batch_indices)):
-                        if dist == self.default_missing_value:
+                        if dist == self.missing_weight:
                             is_valid_edge[idx] = False
                             removed_count += 1
                             graph_distances[idx] = np.inf  # Mark as infinite
@@ -601,7 +601,7 @@ class DataGraphGenerator:
                     graph_distance_computed[batch_indices] = True
                     
                     # Find valid pairs for statistics (positive values and not missing)
-                    valid_mask = (batch_distances > 0) & (batch_euclidean > 0) & (batch_distances != self.default_missing_value)
+                    valid_mask = (batch_distances > 0) & (batch_euclidean > 0) & (batch_distances != self.missing_weight)
                     valid_graph = batch_distances[valid_mask]
                     valid_euclidean = batch_euclidean[valid_mask]
                     
@@ -1115,7 +1115,7 @@ class DataGraphGenerator:
         """
         Smooth the graph by adding connections between 2-hop neighbors.
         
-        NOTE: New edges that have missing values (self.default_missing_value) are not added.
+        NOTE: New edges that have missing values (self.missing_weight) are not added.
         
         Parameters:
         -----------
@@ -1232,7 +1232,7 @@ class DataGraphGenerator:
             
             # Filter out edges with missing values
             for dist, edge in zip(batch_distances, batch_edges):
-                if dist != self.default_missing_value:
+                if dist != self.missing_weight:
                     new_edge_distances.append(dist)
                     valid_new_edges.append(edge)
                 else:
@@ -1503,10 +1503,10 @@ class DataGraphGenerator:
 
     def build_and_refine_graph(self, n_neighbors=30, mst_iterations=3,
                           prune_threshold=None, kneedle_sensitivity=1.0,
-                          smooth_iterations=2, max_new_edges=None, batch_size=None,
+                          polish_iterations=2, max_new_edges=None, batch_size=None,
                           max_components=None, use_median_filter=True, 
                           smooth_before_prune=False, preserve_mst=True,
-                          log_timing=True):
+                          log_timing=True, missing_weight=np.inf):
         """
         Full pipeline to build and refine the DataGraph object with detailed timing statistics
         
@@ -1540,7 +1540,7 @@ class DataGraphGenerator:
             print(f"Using custom embedding and distance functions")
             if self.use_euclidean_as_graph_distance:
                 print(f"OPTIMIZATION: Using Euclidean distances as graph distances")
-            print(f"Missing value indicator: {self.default_missing_value}")
+            print(f"Missing value indicator: {self.missing_weight}")
         
         # No data preparation needed - we're working with the dataframe directly
         
@@ -1566,7 +1566,7 @@ class DataGraphGenerator:
         self.timing.start("step2_refinement")
         final_graph, final_edge_data, history = self.iterative_refine_graph(
             mst_graph, edge_data, node_df, semimetric_weight_function,
-            n_iterations=smooth_iterations,
+            n_iterations=polish_iterations,
             threshold=prune_threshold,
             kneedle_sensitivity=kneedle_sensitivity,
             max_new_edges=max_new_edges,
@@ -1607,7 +1607,8 @@ class DataGraphGenerator:
             semimetric_weight_function=semimetric_weight_function,
             embedding_function=embedding_function,
             edge_data=final_edge_data, 
-            component_labels=component_labels
+            component_labels=component_labels,
+            missing_weight=missing_weight
         )
         
         # End overall timing
