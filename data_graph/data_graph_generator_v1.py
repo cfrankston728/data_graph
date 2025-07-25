@@ -1,6 +1,5 @@
 """
 DataGraphGenerator - Creates and refines a sparse graph over data according to a semimetric weight function
-Updated with missing value handling, MST span checking, and Euclidean optimization
 """
 import numpy as np
 import time
@@ -18,16 +17,16 @@ from numba import njit, prange
 
 from .core_utilities import (
     TimingStats, BatchStats, 
-    make_parallel_batcher,
+make_parallel_batcher,
     find_knee_point, 
-    find_2hop_neighbors_efficient
+find_2hop_neighbors_efficient
 )
 from .data_graph import DataGraph
 
 def prewarm_numba_functions(dist_func, feature_dim=4):
     """
     Pre-warm the numba batcher for dist_func so that the first real call
-    doesn't pay the compilation hit.
+    doesn’t pay the compilation hit.
     """
     # 1) build your parallel batcher
     compute_batch = make_parallel_batcher(dist_func)
@@ -49,11 +48,9 @@ class DataGraphGenerator:
                  semimetric_weight_function,
                  embedding_function,
                  verbose=True, 
-                 use_float32=True,
+                 use_float32=True, # Include option not to use float32
                  n_jobs=-1, 
-                 plot_knee=False,
-                 default_missing_value=np.inf,  # NEW: configurable missing value
-                 use_euclidean_as_graph_distance=False):  # NEW: optimization flag
+                 plot_knee=False):
         """
         Graph generator for a custom distance graph over data
         
@@ -67,20 +64,12 @@ class DataGraphGenerator:
             Number of parallel jobs for parallel operations
         plot_knee : bool, default=False
             Whether to generate a plot of the knee point detection
-        default_missing_value : float, default=np.inf
-            Value returned by semimetric function to indicate missing/invalid edge
-        use_euclidean_as_graph_distance : bool, default=False
-            If True, skip graph distance computation and use Euclidean distances directly.
-            Set to True when you know the semimetric function returns the same values
-            as Euclidean distance in embedding space.
         """
         self.verbose = verbose
         self.use_float32 = use_float32
         self.n_jobs = n_jobs
         self.plot_knee = plot_knee
         self.timing = TimingStats()  # Initialize timing stats
-        self.default_missing_value = default_missing_value
-        self.use_euclidean_as_graph_distance = use_euclidean_as_graph_distance
 
         self.node_df = node_df
         self.feature_cols = feature_cols
@@ -89,9 +78,10 @@ class DataGraphGenerator:
         
         self._extract_node_features()
         # build (or re-build) a batcher for whichever dist‐fn they just passed
-        self._batcher = prewarm_numba_functions(semimetric_weight_function,
-                                               feature_dim=len(self.feature_cols or
-                                                               node_df.select_dtypes(include='number').columns))
+        self._batcher =  prewarm_numba_functions(semimetric_weight_function,
+                                                feature_dim=len(self.feature_cols or
+                                                                  node_df.select_dtypes(include='number').columns))
+        # Pre-warm Numba functions to avoid compilation overhead
 
     def _extract_node_features(self):
         # pick your columns
@@ -101,79 +91,11 @@ class DataGraphGenerator:
             df = self.node_df[self.feature_cols]
     
         # convert to float32 and then force C-order
-        arr = df.to_numpy(dtype=np.float32)
-        arr = np.ascontiguousarray(arr)
+        arr = df.to_numpy(dtype=np.float32)          # no `order=` here
+        arr = np.ascontiguousarray(arr)              # ensure C-contiguous layout
     
         self.node_features = arr
 
-    def _check_mst_span(self, mst, graph, n):
-        """
-        Check if the MST has finite span (all edges have finite weights)
-        
-        Returns:
-        --------
-        bool
-            True if MST has finite span, False otherwise
-        float
-            Total span (sum of edge weights) of the MST
-        """
-        mst_coo = mst.tocoo()
-        
-        # Check for infinite weights
-        if np.any(np.isinf(mst_coo.data)):
-            # Find which edges have infinite weight
-            inf_edges = [(i, j) for i, j, w in zip(mst_coo.row, mst_coo.col, mst_coo.data) 
-                         if np.isinf(w) and i < j]
-            
-            if self.verbose:
-                print(f"         WARNING: MST contains {len(inf_edges)} edges with infinite weight")
-                for i, (u, v) in enumerate(inf_edges[:5]):  # Show first 5
-                    print(f"           Edge ({u}, {v}) has infinite weight")
-                if len(inf_edges) > 5:
-                    print(f"           ... and {len(inf_edges) - 5} more")
-            
-            return False, np.inf
-        
-        # Calculate total span
-        total_span = np.sum(mst_coo.data)
-        return True, total_span
-
-    def _suggest_euclidean_optimization(self, graph_distances, euclidean_distances, threshold=0.01):
-        """
-        Check if graph distances are essentially the same as Euclidean distances
-        
-        Parameters:
-        -----------
-        threshold : float
-            Relative difference threshold to consider distances "the same"
-        
-        Returns:
-        --------
-        bool
-            True if distances are essentially the same
-        """
-        if len(graph_distances) == 0 or len(euclidean_distances) == 0:
-            return False
-            
-        # Compute relative differences for non-zero distances
-        valid_mask = (euclidean_distances > 0) & (graph_distances > 0)
-        if np.sum(valid_mask) == 0:
-            return False
-            
-        valid_graph = graph_distances[valid_mask]
-        valid_euclidean = euclidean_distances[valid_mask]
-        
-        # Check relative differences
-        rel_diff = np.abs(valid_graph - valid_euclidean) / valid_euclidean
-        mean_rel_diff = np.mean(rel_diff)
-        max_rel_diff = np.max(rel_diff)
-        
-        if self.verbose and mean_rel_diff < threshold:
-            print(f"\n         SUGGESTION: Graph distances are very similar to Euclidean distances")
-            print(f"         Mean relative difference: {mean_rel_diff:.2%}, Max: {max_rel_diff:.2%}")
-            print(f"         Consider setting use_euclidean_as_graph_distance=True for better performance\n")
-        
-        return mean_rel_diff < threshold
         
     def estimate_optimal_batch_size(self, n_pairs, feature_dim):
         """Estimate optimal batch size based on data dimensions and available memory"""
@@ -215,20 +137,12 @@ class DataGraphGenerator:
         self.timing.start("extract_mst_edges")
         
         # Compute MST using scipy
-        # scipy MST will ignore zero edges, and floating point errors will cause small weight to vanish. 
-        # Thus we simply add 1 uniformly.
+        # scipy MST will ignore zero edges, and floating point errors will cause small weight to vanish. Thus we simply add 1 uniformly.
         graph.data += 1
         
         self.timing.start("extract_mst_edges.compute_mst")
         mst = minimum_spanning_tree(graph)
         self.timing.end("extract_mst_edges.compute_mst")
-        
-        # Check MST span before proceeding
-        has_finite_span, total_span = self._check_mst_span(mst, graph, n)
-        if not has_finite_span:
-            if self.verbose:
-                print(f"         ERROR: Failed to find MST with finite span")
-                print(f"         The graph may be disconnected or contain invalid edge weights")
         
         # Convert to COO format for edge extraction
         self.timing.start("extract_mst_edges.convert_to_coo")
@@ -292,8 +206,6 @@ class DataGraphGenerator:
         
         if self.verbose:
             print(f"         Final MST has {len(mst_edges)} edges for {n} nodes in {n_components} components")
-            if has_finite_span:
-                print(f"         MST total span: {total_span:.4g}")
         
         self.timing.end("extract_mst_edges")    
         return mst_edges
@@ -317,12 +229,19 @@ class DataGraphGenerator:
         
         if self.verbose:
             print(f"[Step 1] Creating KNN+MST graph: n={n}, k={n_neighbors}")
-            if self.use_euclidean_as_graph_distance:
-                print(f"         Using Euclidean distances as graph distances (optimization mode)")
         
         # Step 1: Create embeddings using the embedding function
         self.timing.start("create_knn_graph_with_mst.compute_embeddings")
         
+        # Compute embeddings for all rows
+        # embeddings = []
+        # for idx, row in node_df.iterrows():
+        #     embedding = embedding_function(row)
+        #     embeddings.append(embedding)
+        
+        # embeddings = np.array(embeddings)
+        # if self.use_float32:
+        #     embeddings = embeddings.astype(np.float32)
         # More efficient: use apply instead of iterrows
         embeddings = np.array(node_df.apply(embedding_function, axis=1).tolist())
         
@@ -380,39 +299,49 @@ class DataGraphGenerator:
 
         print("Building csr knn graph...")
         self.timing.start("create_knn_graph_with_mst.build_knn_graph")
-        # Build KNN graph, handling -1 indices for missing neighbors
-        rows = []
-        cols = []
-        data = []
-        
-        for i in range(n):
-            for j, neighbor_idx in enumerate(idx[i]):
-                if neighbor_idx >= 0:  # Valid neighbor
-                    rows.append(i)
-                    cols.append(neighbor_idx)
-                    data.append(euclidean_distances[i, j])
-        
-        rows = np.array(rows)
-        cols = np.array(cols)
-        data = np.array(data)
-        
-        # Find minimum non-zero distance to use as epsilon
-        non_zero_distances = data[data > 0]
-        if len(non_zero_distances) > 0:
-            epsilon = non_zero_distances.min() * 1e-6  # Much smaller than smallest real distance
+        if False:
+            k_eff = idx.shape[1]
+            rows   = np.repeat(np.arange(n), k_eff)
+            cols   = idx.ravel()
+            knn_weights = euclidean_distances.ravel()
+            G0 = csr_matrix((knn_weights, (rows, cols)), shape=(n, n))
+            # symmetrize by taking the maximum of (i→j) and (j→i)
+            G_knn = G0.maximum(G0.T)
+            # drop all the zero-entries (i.e. non-reciprocated edges)
+            G_knn.eliminate_zeros()
         else:
-            epsilon = 1e-10
-        
-        # Add epsilon to zero distances to preserve them in sparse matrix
-        data = np.where(data == 0, epsilon, data)
-        
-        G0 = csr_matrix((data, (rows, cols)), shape=(n, n))
-        
-        # Symmetrize by taking the maximum of (i→j) and (j→i)
-        G_knn = G0.maximum(G0.T)
-        
+            # Build KNN graph, handling -1 indices for missing neighbors
+            rows = []
+            cols = []
+            data = []
+            
+            for i in range(n):
+                for j, neighbor_idx in enumerate(idx[i]):
+                    if neighbor_idx >= 0:  # Valid neighbor
+                        rows.append(i)
+                        cols.append(neighbor_idx)
+                        data.append(euclidean_distances[i, j])
+            
+            rows = np.array(rows)
+            cols = np.array(cols)
+            data = np.array(data)
+            
+            # Find minimum non-zero distance to use as epsilon
+            non_zero_distances = data[data > 0]
+            if len(non_zero_distances) > 0:
+                epsilon = non_zero_distances.min() * 1e-6  # Much smaller than smallest real distance
+            else:
+                epsilon = 1e-10
+            
+            # Add epsilon to zero distances to preserve them in sparse matrix
+            data = np.where(data == 0, epsilon, data)
+            
+            G0 = csr_matrix((data, (rows, cols)), shape=(n, n))
+            
+            # Symmetrize by taking the maximum of (i→j) and (j→i)
+            G_knn = G0.maximum(G0.T)
+            
         self.timing.end("create_knn_graph_with_mst.build_knn_graph")
-        
         # Check if KNN graph is connected
         self.timing.start("create_knn_graph_with_mst.check_connectivity")
         n_components, component_labels_knn = connected_components(G_knn, directed=False)
@@ -431,10 +360,9 @@ class DataGraphGenerator:
             for lbl, sz in counts.most_common(5):
                 print(f"  {lbl:5d} → {sz:8d}")
             
-            # Maybe also see how many "tiny" islands:
+            # Maybe also see how many “tiny” islands:
             tiny = sum(1 for sz in counts.values() if sz < 100)
             print(f"{tiny} components of size < 100")
-            
         # If KNN graph has multiple components, we need to add edges to connect them
         if n_components > 1:
             self.timing.start("create_knn_graph_with_mst.connect_components")
@@ -474,7 +402,6 @@ class DataGraphGenerator:
         euclidean_distances_list = []  # Store Euclidean distances for each edge
         graph_distance_computed = []   # Boolean mask for which edges have graph distances
         is_mst_edge = []   # Flag to indicate if an edge is part of the MST
-        is_valid_edge = []  # NEW: Flag to indicate if edge should be kept
 
         print("Converting csr to COO format...")
         # Convert to COO format for easy edge extraction
@@ -493,236 +420,189 @@ class DataGraphGenerator:
                     euclidean_distances_list.append(d)  # Store Euclidean distance
                     graph_distance_computed.append(False)
                     is_mst_edge.append(False)  # Mark as MST edge later
-                    is_valid_edge.append(True)  # Initially all edges are valid
                         
         # Convert to numpy arrays for efficiency
         graph_distances = np.array(graph_distances, dtype=np.float32 if self.use_float32 else np.float64)
         euclidean_distances_list = np.array(euclidean_distances_list, dtype=np.float32 if self.use_float32 else np.float64)
         graph_distance_computed = np.array(graph_distance_computed, dtype=bool)
         is_mst_edge = np.array(is_mst_edge, dtype=bool)
-        is_valid_edge = np.array(is_valid_edge, dtype=bool)
         self.timing.end("create_knn_graph_with_mst.initialize_edge_tracking")
         
         # Initialize batch statistics trackers
         graph_distance_stats = BatchStats()
         euclidean_stats = BatchStats()
         
-        # NEW: If using Euclidean optimization, skip graph distance computation
-        if self.use_euclidean_as_graph_distance:
+        # Iterate to compute graph distances
+        for iteration in range(max_iterations):
+            self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}")
             if self.verbose:
-                print(f"         Skipping graph distance computation (using Euclidean distances)")
+                print(f"         Iteration {iteration+1}/{max_iterations} of distance refinement")
             
-            # Copy Euclidean distances as graph distances
-            graph_distances[:] = euclidean_distances_list
-            graph_distance_computed[:] = True
+            # Find edges that don't have graph distances computed yet
+            uncomputed_indices = np.where(~graph_distance_computed)[0]
             
-            # Update statistics
-            valid_mask = euclidean_distances_list > 0
-            if np.sum(valid_mask) > 0:
-                graph_distance_stats.update_batch(euclidean_distances_list[valid_mask])
-                euclidean_stats.update_batch(euclidean_distances_list[valid_mask])
-            
-            scale_factor = 1.0  # No scaling needed
-            
-        else:
-            # Original iterative computation logic
-            for iteration in range(max_iterations):
-                self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}")
+            if len(uncomputed_indices) == 0:
                 if self.verbose:
-                    print(f"         Iteration {iteration+1}/{max_iterations} of distance refinement")
+                    print(f"         All edges have graph distances computed. Stopping iteration.")
                 
-                # Find edges that don't have graph distances computed yet
-                uncomputed_indices = np.where(~graph_distance_computed)[0]
-                
-                if len(uncomputed_indices) == 0:
-                    if self.verbose:
-                        print(f"         All edges have graph distances computed. Stopping iteration.")
+                # Report MST diameters if requested
+                if report_mst_diameters:
+                    # Calculate MST diameter using unscaled graph distances
+                    # Create a graph containing only the MST edges with unscaled graph distances
+                    mst_graph = np.zeros((n, n), dtype=np.float32 if self.use_float32 else np.float64)
+                    mst_edge_count = 0
+                    for idx, (i, j) in enumerate(edge_list):
+                        if is_mst_edge[idx] and graph_distance_computed[idx]:
+                            mst_graph[i, j] = graph_distances[idx]  # Use unscaled graph distances
+                            mst_graph[j, i] = graph_distances[idx]
+                            mst_edge_count += 1
                     
-                    self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}")
-                    break
-                
-                # Get edges that need graph distances
-                new_i = []
-                new_j = []
-                new_edge_indices = []
-                
-                for idx in uncomputed_indices:
-                    i, j = edge_list[idx]
-                    new_i.append(i)
-                    new_j.append(j)
-                    new_edge_indices.append(idx)
-                
-                new_i = np.array(new_i, dtype=np.int32)
-                new_j = np.array(new_j, dtype=np.int32)
-                new_edge_indices = np.array(new_edge_indices, dtype=np.int32)
-                
-                if self.verbose:
-                    print(f"         Computing {len(new_i)} new graph distances")
-                
-                # Compute optimal batch size if needed
-                if batch_size is None:
-                    embedding_dim = embeddings.shape[1]
-                    batch_size = self.estimate_optimal_batch_size(len(new_i), embedding_dim)
-                
-                if self.verbose and len(new_i) > batch_size:
-                    print(f"         Processing in {len(new_i) // batch_size + 1} batches of size {batch_size}")
-                    
-                self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.compute_graph_distances")
-                
-                removed_count = 0  # Track removed edges
-                
-                for batch_idx in range(0, len(new_i), batch_size):
-                    if self.verbose and len(new_i) > batch_size and batch_idx % (10 * batch_size) == 0:
-                        print(f"         Processing batch {batch_idx//batch_size + 1}/{(len(new_i)-1)//batch_size + 1}")
-                    
-                    end_idx = min(batch_idx + batch_size, len(new_i))
-                    batch_i = new_i[batch_idx:end_idx]
-                    batch_j = new_j[batch_idx:end_idx]
-                    batch_indices = new_edge_indices[batch_idx:end_idx]
-                    
-                    # Compute distances for this batch
-                    batch_distances = self._batcher(
-                        self.node_features, batch_i, batch_j
-                    )
-                    
-                    # NEW: Check for missing values and mark invalid edges
-                    for i, (dist, idx) in enumerate(zip(batch_distances, batch_indices)):
-                        if dist == self.default_missing_value:
-                            is_valid_edge[idx] = False
-                            removed_count += 1
-                            graph_distances[idx] = np.inf  # Mark as infinite
+                    if mst_edge_count > 0:
+                        # Use Floyd-Warshall algorithm to compute all-pairs shortest paths
+                        from scipy.sparse.csgraph import floyd_warshall
+                        dist_matrix = floyd_warshall(csr_matrix(mst_graph))
+                        
+                        # Find the diameter (maximum finite distance)
+                        finite_dists = dist_matrix[np.isfinite(dist_matrix)]
+                        if len(finite_dists) > 0:
+                            diameter = np.max(finite_dists)
+                            print(f"         MST diameter (unscaled graph distances): {diameter:.4g}, with {mst_edge_count} MST edges having graph distances")
                         else:
-                            graph_distances[idx] = dist
-                    
-                    # Get the corresponding Euclidean distances for this batch
-                    batch_euclidean = euclidean_distances_list[batch_indices]
-                    
-                    # Update computed flags
-                    graph_distance_computed[batch_indices] = True
-                    
-                    # Find valid pairs for statistics (positive values and not missing)
-                    valid_mask = (batch_distances > 0) & (batch_euclidean > 0) & (batch_distances != self.default_missing_value)
-                    valid_graph = batch_distances[valid_mask]
-                    valid_euclidean = batch_euclidean[valid_mask]
-                    
-                    # Update batch statistics
-                    if len(valid_graph) > 0:
-                        graph_distance_stats.update_batch(valid_graph)
-                        euclidean_stats.update_batch(valid_euclidean)
-                
-                if removed_count > 0 and self.verbose:
-                    print(f"         Removed {removed_count} edges with missing values")
-                
-                self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.compute_graph_distances")
-        
-                # Calculate scaling factor between graph and Euclidean distances using batch statistics
-                if graph_distance_stats.count > 0:
-                    graph_distance_mean = graph_distance_stats.mean
-                    euclidean_mean = euclidean_stats.mean
-                    scale_factor = euclidean_mean / graph_distance_mean if graph_distance_mean > 0 else 1.0
-                    
-                    if self.verbose:
-                        print(f"         Scale factor: {scale_factor:.4g} "
-                              f"(graph mean: {graph_distance_mean:.4g}, Euclidean mean: {euclidean_mean:.4g})")
-                        print(f"         graph stats: min={graph_distance_stats.min_val:.4g}, max={graph_distance_stats.max_val:.4g}, "
-                              f"std={graph_distance_stats.get_std():.4g}, count={graph_distance_stats.count}")
-                    
-                    # Check if we should suggest Euclidean optimization
-                    if iteration == 0:  # Only check on first iteration
-                        self._suggest_euclidean_optimization(graph_distances[graph_distance_computed], 
-                                                           euclidean_distances_list[graph_distance_computed])
-                else:
-                    scale_factor = 1.0
-                    if self.verbose:
-                        print(f"         No completed graph distances yet. Using scale factor of 1.0")
-                
-                # Create hybrid distances for MST computation:
-                # - Scaled graph distances when available
-                # - Euclidean distances as fallback
-                # - Infinite for invalid edges
-                self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.build_hybrid_graph")
-                hybrid_distances = np.where(
-                    ~is_valid_edge,
-                    np.inf,  # Invalid edges get infinite distance
-                    np.where(
-                        graph_distance_computed,
-                        graph_distances * scale_factor,  # Use scaled graph distances when available
-                        euclidean_distances_list      # Fall back to Euclidean
-                    )
-                )
-                
-                # Create hybrid graph for MST computation
-                hybrid_rows = []
-                hybrid_cols = []
-                hybrid_data = []
-                
-                for idx, (i, j) in enumerate(edge_list):
-                    if is_valid_edge[idx]:  # Only include valid edges
-                        dist = hybrid_distances[idx]
-                        hybrid_rows.extend([i, j])
-                        hybrid_cols.extend([j, i])
-                        hybrid_data.extend([dist, dist])
-                
-                hybrid_graph = csr_matrix(
-                    (hybrid_data, (hybrid_rows, hybrid_cols)), 
-                    shape=(n, n)
-                )
-                self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.build_hybrid_graph")
-                
-                # Extract MST from hybrid graph
-                self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
-                mst_edges = self.extract_mst_edges(hybrid_graph, n)
-                self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
-                
-                # Update MST edge flags
-                is_mst_edge[:] = False  # Reset all flags
-                for i, j in mst_edges:
-                    edge_key = (i, j)
-                    if edge_key in edge_map:
-                        idx = edge_map[edge_key]
-                        is_mst_edge[idx] = True
+                            print(f"         MST is disconnected or has no finite paths with graph distances")
+                    else:
+                        print(f"         No MST edges have graph distances computed yet")
                 
                 self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}")
-        
-        # Report MST diameters if requested (moved outside iteration loop for optimization mode)
-        if report_mst_diameters:
-            # Calculate MST diameter using unscaled graph distances
-            # Create a graph containing only the MST edges with unscaled graph distances
-            mst_graph = np.zeros((n, n), dtype=np.float32 if self.use_float32 else np.float64)
-            mst_edge_count = 0
-            for idx, (i, j) in enumerate(edge_list):
-                if is_mst_edge[idx] and graph_distance_computed[idx] and is_valid_edge[idx]:
-                    mst_graph[i, j] = graph_distances[idx]  # Use unscaled graph distances
-                    mst_graph[j, i] = graph_distances[idx]
-                    mst_edge_count += 1
+                break
             
-            if mst_edge_count > 0:
-                # Use Floyd-Warshall algorithm to compute all-pairs shortest paths
-                from scipy.sparse.csgraph import floyd_warshall
-                dist_matrix = floyd_warshall(csr_matrix(mst_graph))
+            # Get edges that need graph distances
+            new_i = []
+            new_j = []
+            new_edge_indices = []
+            
+            for idx in uncomputed_indices:
+                i, j = edge_list[idx]
+                new_i.append(i)
+                new_j.append(j)
+                new_edge_indices.append(idx)
+            
+            new_i = np.array(new_i, dtype=np.int32)
+            new_j = np.array(new_j, dtype=np.int32)
+            new_edge_indices = np.array(new_edge_indices, dtype=np.int32)
+            
+            if self.verbose:
+                print(f"         Computing {len(new_i)} new graph distances")
+            
+            # Compute optimal batch size if needed
+            if batch_size is None:
+                embedding_dim = embeddings.shape[1]
+                batch_size = self.estimate_optimal_batch_size(len(new_i), embedding_dim)
+            
+            if self.verbose and len(new_i) > batch_size:
+                print(f"         Processing in {len(new_i) // batch_size + 1} batches of size {batch_size}")
                 
-                # Find the diameter (maximum finite distance)
-                finite_dists = dist_matrix[np.isfinite(dist_matrix)]
-                if len(finite_dists) > 0:
-                    diameter = np.max(finite_dists)
-                    print(f"         MST diameter (unscaled graph distances): {diameter:.4g}, with {mst_edge_count} MST edges having graph distances")
-                else:
-                    print(f"         MST is disconnected or has no finite paths with graph distances")
+            self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.compute_graph_distances")
+            for batch_idx in range(0, len(new_i), batch_size):
+                if self.verbose and len(new_i) > batch_size and batch_idx % (10 * batch_size) == 0:
+                    print(f"         Processing batch {batch_idx//batch_size + 1}/{(len(new_i)-1)//batch_size + 1}")
+                
+                end_idx = min(batch_idx + batch_size, len(new_i))
+                batch_i = new_i[batch_idx:end_idx]
+                batch_j = new_j[batch_idx:end_idx]
+                batch_indices = new_edge_indices[batch_idx:end_idx]
+                
+                # Compute distances for this batch
+                batch_distances = self._batcher(
+                    self.node_features, batch_i, batch_j
+                )
+                
+                # Get the corresponding Euclidean distances for this batch
+                batch_euclidean = euclidean_distances_list[batch_indices]
+                
+                # Update the graph distances for this batch
+                graph_distances[batch_indices] = batch_distances
+                graph_distance_computed[batch_indices] = True
+                
+                # Find valid pairs for statistics (positive values for both graph and Euclidean)
+                valid_mask = (batch_distances > 0) & (batch_euclidean > 0)
+                valid_graph = batch_distances[valid_mask]
+                valid_euclidean = batch_euclidean[valid_mask]
+                
+                # Update batch statistics
+                if len(valid_graph) > 0:
+                    graph_distance_stats.update_batch(valid_graph)
+                    euclidean_stats.update_batch(valid_euclidean)
+            self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.compute_graph_distances")
+    
+            # Calculate scaling factor between graph and Euclidean distances using batch statistics
+            if graph_distance_stats.count > 0:
+                graph_distance_mean = graph_distance_stats.mean
+                euclidean_mean = euclidean_stats.mean
+                scale_factor = euclidean_mean / graph_distance_mean if graph_distance_mean > 0 else 1.0
+                
+                if self.verbose:
+                    print(f"         Scale factor: {scale_factor:.4g} "
+                          f"(graph mean: {graph_distance_mean:.4g}, Euclidean mean: {euclidean_mean:.4g})")
+                    print(f"         graph stats: min={graph_distance_stats.min_val:.4g}, max={graph_distance_stats.max_val:.4g}, "
+                          f"std={graph_distance_stats.get_std():.4g}, count={graph_distance_stats.count}")
             else:
-                print(f"         No MST edges have valid graph distances computed")
+                scale_factor = 1.0
+                if self.verbose:
+                    print(f"         No completed graph distances yet. Using scale factor of 1.0")
+            
+            # Create hybrid distances for MST computation:
+            # - Scaled graph distances when available
+            # - Euclidean distances as fallback
+            self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.build_hybrid_graph")
+            hybrid_distances = np.where(
+                graph_distance_computed,
+                graph_distances * scale_factor,  # Use scaled graph distances when available
+                euclidean_distances_list      # Fall back to Euclidean
+            )
+            
+            # Create hybrid graph for MST computation
+            hybrid_rows = []
+            hybrid_cols = []
+            hybrid_data = []
+            
+            for idx, (i, j) in enumerate(edge_list):
+                dist = hybrid_distances[idx]
+                hybrid_rows.extend([i, j])
+                hybrid_cols.extend([j, i])
+                hybrid_data.extend([dist, dist])
+            
+            hybrid_graph = csr_matrix(
+                (hybrid_data, (hybrid_rows, hybrid_cols)), 
+                shape=(n, n)
+            )
+            self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.build_hybrid_graph")
+            
+            # Extract MST from hybrid graph
+            self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
+            mst_edges = self.extract_mst_edges(hybrid_graph, n)
+            self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
+            
+            # Update MST edge flags
+            is_mst_edge[:] = False  # Reset all flags
+            for i, j in mst_edges:
+                edge_key = (i, j)
+                if edge_key in edge_map:
+                    idx = edge_map[edge_key]
+                    is_mst_edge[idx] = True
+            
+            self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}")
         
-        # Create the final graph with graph distances (excluding invalid edges)
+        # Create the final graph with graph distances
         self.timing.start("create_knn_graph_with_mst.build_final_graph")
         rows = []
         cols = []
         data = []
         
         for idx, (i, j) in enumerate(edge_list):
-            if is_valid_edge[idx]:  # Only include valid edges
-                dist = graph_distances[idx]
-                rows.extend([i, j])
-                cols.extend([j, i])
-                data.extend([dist, dist])
+            dist = graph_distances[idx]
+            rows.extend([i, j])
+            cols.extend([j, i])
+            data.extend([dist, dist])
         
         final_graph = csr_matrix(
             (data, (rows, cols)), 
@@ -736,47 +616,30 @@ class DataGraphGenerator:
         self.timing.end("create_knn_graph_with_mst.final_verification")
         
         if self.verbose:
-            valid_edge_count = np.sum(is_valid_edge)
             mst_edge_count = np.sum(is_mst_edge)
-            print(f"         Combined graph has {valid_edge_count} valid edges (of {len(edge_list)} total), "
-                  f"including {mst_edge_count} MST edges")
+            print(f"         Combined graph has {len(edge_list)} edges, including {mst_edge_count} MST edges")
             print(f"         Final graph has {n_components_final} connected components")
             if n_components_final > 1:
                 print(f"         WARNING: Final graph is not fully connected!")
         
         self.timing.end("create_knn_graph_with_mst")
         
-        # Filter edge data to only include valid edges
-        valid_indices = np.where(is_valid_edge)[0]
-        filtered_edge_list = [edge_list[i] for i in valid_indices]
-        filtered_graph_distances = graph_distances[valid_indices]
-        filtered_euclidean_distances = euclidean_distances_list[valid_indices]
-        filtered_is_mst_edge = is_mst_edge[valid_indices]
-        
-        # Rebuild edge map
-        filtered_edge_map = {edge: i for i, edge in enumerate(filtered_edge_list)}
-        
         return final_graph, {
-            'edge_list': filtered_edge_list,
-            'graph_distances': filtered_graph_distances,
-            'euclidean_distances': filtered_euclidean_distances,
-            'edge_map': filtered_edge_map,
-            'is_mst_edge': filtered_is_mst_edge,
+            'edge_list': edge_list,
+            'graph_distances': graph_distances,
+            'euclidean_distances': euclidean_distances_list,
+            'edge_map': edge_map,
+            'is_mst_edge': is_mst_edge,
             'graph_distance_scalar': scale_factor,
             # Add statistics to the returned data
             'graph_distance_stats': graph_distance_stats.get_stats() if graph_distance_stats.count > 0 else None,
-            'euclidean_stats': euclidean_stats.get_stats() if euclidean_stats.count > 0 else None,
-            'n_removed_edges': len(edge_list) - len(filtered_edge_list),  # Track removed edges
-            'use_euclidean_as_graph_distance': self.use_euclidean_as_graph_distance
+            'euclidean_stats': euclidean_stats.get_stats() if euclidean_stats.count > 0 else None
         }
     
     def prune_graph_by_threshold(self, graph, edge_data, threshold=None, kneedle_sensitivity=1.0, 
                                max_components=None, use_median_filter=True, preserve_mst=True):
         """
-        Prune a graph by removing edges with distances above a threshold.
-        
-        NOTE: Edges that exceed the threshold are already removed during computation,
-        so this method primarily handles automatic threshold detection and additional pruning.
+        Prune a graph by removing edges with distances above a threshold
         
         Parameters:
         -----------
@@ -1071,11 +934,6 @@ class DataGraphGenerator:
         # Copy over other statistics if they were available
         if 'euclidean_stats' in edge_data:
             pruned_edge_data['euclidean_stats'] = edge_data['euclidean_stats']
-            
-        # Copy over optimization flag
-        if 'use_euclidean_as_graph_distance' in edge_data:
-            pruned_edge_data['use_euclidean_as_graph_distance'] = edge_data['use_euclidean_as_graph_distance']
-            
         self.timing.end("prune_graph_by_threshold.create_edge_data")
         
         # Verify the pruned graph
@@ -1110,12 +968,9 @@ class DataGraphGenerator:
             'threshold': threshold
         }
 
-    def smooth_graph_with_2hop(self, graph, edge_data, node_df, semimetric_weight_function, 
-                              max_new_edges=None, batch_size=None):
+    def smooth_graph_with_2hop(self, graph, edge_data, node_df, semimetric_weight_function, max_new_edges=None, batch_size=None):
         """
-        Smooth the graph by adding connections between 2-hop neighbors.
-        
-        NOTE: New edges that have missing values (self.default_missing_value) are not added.
+        Smooth the graph by adding connections between 2-hop neighbors
         
         Parameters:
         -----------
@@ -1147,9 +1002,6 @@ class DataGraphGenerator:
         edge_map = edge_data['edge_map']
         graph_distances = edge_data['graph_distances']
         
-        # Check if using Euclidean optimization
-        use_euclidean = edge_data.get('use_euclidean_as_graph_distance', False)
-        
         # Create a set of existing edges for fast lookup
         existing_edges = set(edge_list)
         
@@ -1166,7 +1018,7 @@ class DataGraphGenerator:
             new_edges = [new_edges[i] for i in random_indices]
         
         if self.verbose:
-            print(f"         Adding up to {len(new_edges)} new 2-hop connections")
+            print(f"         Adding {len(new_edges)} new 2-hop connections")
         
         # If no new edges, return early
         if len(new_edges) == 0:
@@ -1186,15 +1038,6 @@ class DataGraphGenerator:
         
         # Compute graph distances for new edges in batches
         new_edge_distances = []
-        valid_new_edges = []  # Track which edges are valid
-        
-        # If using Euclidean optimization, compute embeddings once
-        if use_euclidean:
-            if self.verbose:
-                print(f"         Using Euclidean distances for 2-hop edges (optimization mode)")
-            embeddings = np.array(node_df.apply(self.embedding_function, axis=1).tolist())
-            if self.use_float32:
-                embeddings = embeddings.astype(np.float32)
         
         # Process in batches to reduce memory pressure
         self.timing.start("smooth_graph_with_2hop.compute_distances")
@@ -1206,9 +1049,7 @@ class DataGraphGenerator:
         n_batches = (len(new_edges) - 1) // batch_size + 1
         if self.verbose and len(new_edges) > batch_size:
             print(f"         Processing in {n_batches} batches of size {batch_size}")
-        
-        removed_count = 0  # Track edges with missing values
-        
+            
         for batch_idx in range(0, len(new_edges), batch_size):
             if self.verbose and len(new_edges) > batch_size and batch_idx % (10 * batch_size) == 0:
                 print(f"         Processing batch {batch_idx//batch_size + 1}/{n_batches}")
@@ -1216,46 +1057,13 @@ class DataGraphGenerator:
             end_idx = min(batch_idx + batch_size, len(new_edges))
             batch_i = new_i[batch_idx:end_idx]
             batch_j = new_j[batch_idx:end_idx]
-            batch_edges = new_edges[batch_idx:end_idx]
             
-            if use_euclidean:
-                # Compute Euclidean distances directly
-                batch_distances = np.array([
-                    np.linalg.norm(embeddings[i] - embeddings[j])
-                    for i, j in zip(batch_i, batch_j)
-                ])
-            else:
-                # Compute distances for this batch using the custom function
-                batch_distances = self._batcher(
-                    self.node_features, batch_i, batch_j
-                )
-            
-            # Filter out edges with missing values
-            for dist, edge in zip(batch_distances, batch_edges):
-                if dist != self.default_missing_value:
-                    new_edge_distances.append(dist)
-                    valid_new_edges.append(edge)
-                else:
-                    removed_count += 1
-                    
+            # Compute distances for this batch using the custom function
+            batch_distances = self._batcher(
+                self.node_features, batch_i, batch_j
+            )
+            new_edge_distances.extend(batch_distances)
         self.timing.end("smooth_graph_with_2hop.compute_distances")
-        
-        if removed_count > 0 and self.verbose:
-            print(f"         Skipped {removed_count} 2-hop edges with missing values")
-            print(f"         Adding {len(valid_new_edges)} valid new edges")
-        
-        # If no valid edges remain, return early
-        if len(valid_new_edges) == 0:
-            if self.verbose:
-                print(f"         No valid 2-hop connections to add after filtering")
-            
-            self.timing.end("smooth_graph_with_2hop")
-            return graph, edge_data, {
-                'n_new_edges': 0,
-                'new_edges': [],
-                'new_distances': [],
-                'n_removed': removed_count
-            }
         
         # Add new edges to the graph more efficiently
         self.timing.start("smooth_graph_with_2hop.add_edges")
@@ -1265,7 +1073,7 @@ class DataGraphGenerator:
         smoothed_graph = graph.copy()  # Still need one copy
         
         # Add new edges directly to the smoothed graph
-        for idx, (i, j) in enumerate(valid_new_edges):
+        for idx, (i, j) in enumerate(new_edges):
             dist = new_edge_distances[idx]
             smoothed_graph[i, j] = dist
             smoothed_graph[j, i] = dist  # Keep the graph symmetric
@@ -1321,11 +1129,6 @@ class DataGraphGenerator:
         # Add MST edge information if it was available
         if has_mst_info:
             smoothed_edge_data['is_mst_edge'] = np.array(smoothed_is_mst_edge)
-            
-        # Copy over optimization flag
-        if 'use_euclidean_as_graph_distance' in edge_data:
-            smoothed_edge_data['use_euclidean_as_graph_distance'] = edge_data['use_euclidean_as_graph_distance']
-            
         self.timing.end("smooth_graph_with_2hop.update_edge_data")
         
         # Verify the smoothed graph
@@ -1356,10 +1159,9 @@ class DataGraphGenerator:
         
         self.timing.end("smooth_graph_with_2hop")
         return smoothed_graph, smoothed_edge_data, {
-            'n_new_edges': len(valid_new_edges),
-            'new_edges': valid_new_edges,
-            'new_distances': new_edge_distances,
-            'n_removed': removed_count
+            'n_new_edges': len(new_edges),
+            'new_edges': new_edges,
+            'new_distances': new_edge_distances
         }
     
     def iterative_refine_graph(self,
@@ -1380,11 +1182,6 @@ class DataGraphGenerator:
         Iteratively refine the graph by pruning and (optionally) smoothing.
     
         If max_new_edges is 0, smoothing is skipped entirely.
-        
-        NOTE: The smoothing and pruning steps operate independently:
-        - Smoothing adds 2-hop edges (filtered by missing values)
-        - Pruning removes high-distance edges (preserving MST if specified)
-        The order is controlled by smooth_first parameter.
     
         Returns:
         --------
@@ -1425,7 +1222,7 @@ class DataGraphGenerator:
                     )
                 else:
                     sm_graph, sm_edge_data, sm_res = (
-                        current_graph, current_edge_data, {'n_new_edges': 0, 'n_removed': 0}
+                        current_graph, current_edge_data, {'n_new_edges': 0}
                     )
     
                 # 1b) Prune
@@ -1454,12 +1251,12 @@ class DataGraphGenerator:
                 # 2b) Smooth (if enabled)
                 if do_smoothing:
                     sm_graph, sm_edge_data, sm_res = self.smooth_graph_with_2hop(
-                        pr_graph, pr_edge_data, node_df, semimetric_weight_function,
+                        pr_graph, pr_edge_data, node_df, semimetric_weight_function,  # Fixed!
                         max_new_edges=max_new_edges, batch_size=batch_size
                     )
                 else:
                     sm_graph, sm_edge_data, sm_res = (
-                        pr_graph, pr_edge_data, {'n_new_edges': 0, 'n_removed': 0}
+                        pr_graph, pr_edge_data, {'n_new_edges': 0}
                     )
     
                 next_graph, next_edge_data = sm_graph, sm_edge_data
@@ -1472,11 +1269,10 @@ class DataGraphGenerator:
                 'iteration': it,
                 'smooth_first': smooth_first,
                 'n_new_edges': sm_res.get('n_new_edges', 0),
-                'n_removed_smoothing': sm_res.get('n_removed', 0),  # Track removed during smoothing
                 'prune_threshold': pr_res.get('threshold'),
                 'n_pruned_edges': len(pr_res.get('pruned_edges', [])),
                 'n_edges': current_edge_count,
-                'edge_change_percent': edge_change_percent
+                'edge_change_percent': edge_change_percent  # Added to history
             })
             
             # Check for early stopping (minimal change in edge count)
@@ -1538,9 +1334,6 @@ class DataGraphGenerator:
             print(f"[Build & Refine] START")
             print(f"Processing {n} nodes")
             print(f"Using custom embedding and distance functions")
-            if self.use_euclidean_as_graph_distance:
-                print(f"OPTIMIZATION: Using Euclidean distances as graph distances")
-            print(f"Missing value indicator: {self.default_missing_value}")
         
         # No data preparation needed - we're working with the dataframe directly
         
@@ -1557,15 +1350,13 @@ class DataGraphGenerator:
         
         if log_timing:
             print(f"  • Step 1 (KNN+MST) done in {step1_time:.2f}s")
-            if 'n_removed_edges' in edge_data:
-                print(f"    - Removed {edge_data['n_removed_edges']} edges with missing values")
             print(self.timing.report_nested_timing("create_knn_graph_with_mst"))
     
         # Step 2: iterative prune/smooth
         t2 = time.time()
         self.timing.start("step2_refinement")
         final_graph, final_edge_data, history = self.iterative_refine_graph(
-            mst_graph, edge_data, node_df, semimetric_weight_function,
+            mst_graph, edge_data, node_df, semimetric_weight_function,  # Added semimetric_weight_function
             n_iterations=smooth_iterations,
             threshold=prune_threshold,
             kneedle_sensitivity=kneedle_sensitivity,
@@ -1653,8 +1444,6 @@ class DataGraphGenerator:
                 print(f"    - {fr_compute_count} batches processed")
                 if batch_size:
                     print(f"    - Using batch size: {batch_size}")
-                if self.use_euclidean_as_graph_distance:
-                    print(f"    - NOTE: Skipped due to Euclidean optimization")
                 
             # MST extraction cost
             mst_time = sum(stats['total'] for op, stats in sorted_ops if "extract_mst" in op)
