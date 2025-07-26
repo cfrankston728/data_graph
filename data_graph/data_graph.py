@@ -97,6 +97,8 @@ class DataGraph:
             self.component_sizes = np.bincount(component_labels)
 
         self._extract_node_features()
+
+        self.coarsened_graph = None
     
     @staticmethod
     def _default_weight_function(features, i, j):

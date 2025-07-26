@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 
 from scipy import sparse
 from scipy.sparse import csr_matrix, coo_matrix
+from scipy.sparse import lil_matrix
+from scipy.spatial.distance import cdist
 from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
 from sklearn.neighbors import NearestNeighbors
 
@@ -442,19 +444,50 @@ class DataGraphGenerator:
                 print(f"         Adding edges to connect all components")
             
             # Find representatives for each component
-            component_reps = {}
-            for i, comp in enumerate(component_labels_knn):
-                if comp not in component_reps:
-                    component_reps[comp] = i
+            if False:
+                component_reps = {}
+                for i, comp in enumerate(component_labels_knn):
+                    if comp not in component_reps:
+                        component_reps[comp] = i
+            else:
+                print('Selecting least connected representatives of each connected component representatives...')
+                component_reps = {}
+                for comp in np.unique(component_labels_knn):
+                    nodes = np.where(component_labels_knn == comp)[0]
+                    degrees = np.diff(G_knn.indptr)[nodes]
+                    boundary = nodes[np.argmin(degrees)]
+                    component_reps[comp] = boundary
             
             # Create a fully connected graph between component representatives
-            for comp1, rep1 in component_reps.items():
-                for comp2, rep2 in component_reps.items():
-                    if comp1 < comp2:  # Only add each edge once
-                        # Use Euclidean distance as initial weight
-                        dist = np.linalg.norm(embeddings[rep1] - embeddings[rep2])
-                        G_knn[rep1, rep2] = dist
-                        G_knn[rep2, rep1] = dist
+            if False:
+                for comp1, rep1 in component_reps.items():
+                    for comp2, rep2 in component_reps.items():
+                        if comp1 < comp2:  # Only add each edge once
+                            # Use Euclidean distance as initial weight
+                            dist = np.linalg.norm(embeddings[rep1] - embeddings[rep2])
+                            G_knn[rep1, rep2] = dist
+                            G_knn[rep2, rep1] = dist
+            else:
+                print('Computing MST of connected component representatives (in embedding)...')
+                # 2. Compute all-pairs Euclidean distances between representatives
+                reps = np.array(list(component_reps.values()))
+                D = cdist(embeddings[reps], embeddings[reps])
+                
+                # 3. MST over meta-graph
+                mst = minimum_spanning_tree(D).toarray()
+                edges_to_add = np.argwhere(mst > 0)
+                
+                # 4. Efficiently batch-update graph (switch to LIL)
+                print('Converting disconnected KNN graph to LIL format...')
+                G_knn = G_knn.tolil()
+                for i, j in edges_to_add:
+                    u = reps[i]
+                    v = reps[j]
+                    dist = D[i, j]
+                    G_knn[u, v] = dist
+                    G_knn[v, u] = dist  # For undirected graphs
+                print('Converting LIL graph back to CSR format...')
+                G_knn = G_knn.tocsr()
                         
             # Verify the graph is now connected
             n_components_after, _ = connected_components(G_knn, directed=False)
