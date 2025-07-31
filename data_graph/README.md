@@ -1,116 +1,145 @@
 # DataGraphGenerator: Custom Distance Graph Library
 
-A Python library for creating and refining sparse graph representations of data according to custom semimetric weighting functions.
+A Python library for creating and refining sparse graph representations of data according to custom **premetric** weighting functions.
 
 ## Overview
 
-DataGraphGenerator builds data-driven graphs where edges represent meaningful relationships between data points. It uses custom weight edges and applies graph refinement techniques to produce high-quality sparse graph representations.
+`DataGraphGenerator` builds data-driven graphs where edges represent meaningful relationships between data points. It leverages user-defined premetric weight functions and applies graph refinement techniques to produce high-quality, sparse graph representations.
 
 ## Key Features
 
-- Custom distance metrics through user-defined semimetric weight functions
-- Flexible embedding functions for initial neighbor discovery
-- Robust graph construction with MST to ensure connectivity
-- Intelligent graph pruning with automatic threshold detection
-- Graph smoothing by connecting 2-hop neighbors
-- Iterative refinement for optimal graph structure
-- Comprehensive timing statistics and optimization diagnostics
-- Memory-efficient batch processing for large datasets
+* **Custom premetric** weight functions for flexible distance definitions
+* Embedding-based KNN for initial neighbor discovery
+* MST-based connectivity to guarantee a fully connected backbone
+* Automatic knee-point detection for intelligent graph pruning
+* Graph polishing via 2-hop neighbor connections
+* Iterative refine-and-polish cycles controlled by `polish_iterations`
+* Comprehensive timing statistics and optimization diagnostics
+* Memory-efficient batch processing for large datasets
 
 ## Usage Example
 
 ```python
 import pandas as pd
 import numpy as np
+from numba import njit
 from data_graph_generator import DataGraphGenerator
 
-# Define custom distance function (Numba-compatible)
+# 1. Define a Numba-compatible premetric function
 @njit(parallel=True)
-def my_distance(features, i_indices, j_indices):
-    """Compute custom distances between pairs of data points"""
+def my_premetric(features, i_indices, j_indices):
+    """Compute custom premetric distances between data point pairs."""
     result = np.zeros(len(i_indices), dtype=np.float32)
     for idx in range(len(i_indices)):
         i, j = i_indices[idx], j_indices[idx]
-        # Custom distance calculation
+        # Example: Manhattan distance
         result[idx] = np.sum(np.abs(features[i] - features[j]))
     return result
 
-# Define embedding function for initial neighbor discovery
+# 2. Define an embedding function for KNN search
 def my_embedding(row):
-    """Convert a data row to coordinates for KNN search"""
-    return np.array([row['feature1'], row['feature2']])
+    """Map DataFrame row to numeric vector for neighbor search."""
+    return np.array([row['x'], row['y']])
 
-# Create graph generator
+# 3. Create the graph generator
 generator = DataGraphGenerator(
     node_df=df,
-    feature_cols=['feature1', 'feature2', 'feature3'],
-    semimetric_weight_function=my_distance,
-    embedding_function=my_embedding
+    feature_cols=['x', 'y', 'z'],
+    premetric_weight_function=my_premetric,
+    embedding_function=my_embedding,
+    verbose=True
 )
 
-# Build and refine graph
+# 4. Build and refine the graph
 graph_obj, results = generator.build_and_refine_graph(
     n_neighbors=30,
     mst_iterations=3,
-    smooth_iterations=2,
+    polish_iterations=2,    # renamed from smooth_iterations
+    prune_threshold=None,
+    kneedle_sensitivity=1.0,
+    max_new_edges=500,      # limit on 2-hop additions
     preserve_mst=True
 )
 
-# Access the graph
-sparse_matrix = graph_obj.graph
-component_labels = graph_obj.component_labels
+# 5. Inspect results
+sparse_graph = graph_obj.graph          # scipy.sparse.csr_matrix
+labels = graph_obj.component_labels     # numpy array of component IDs
+stats = results['timing_summary']      # timing breakdown
 ```
 
 ## Core Components
 
-### DataGraphGenerator
+### `DataGraphGenerator`
 
-The main class that orchestrates graph creation and refinement:
+Main class that orchestrates the pipeline:
 
 ```python
 generator = DataGraphGenerator(
-    node_df,                      # DataFrame with node data
-    feature_cols,                 # Columns to use for distance calculation
-    semimetric_weight_function,   # Custom distance function
-    embedding_function,           # Function to create coordinates for KNN
-    verbose=True,                 # Print progress messages
-    use_float32=True,             # Use float32 for memory efficiency
-    n_jobs=-1,                    # Parallel processing jobs
-    plot_knee=False               # Plot knee point detection
+    node_df,                       # pandas.DataFrame of nodes
+    feature_cols,                  # list of columns to compute premetric
+    premetric_weight_function,     # custom premetric weight function
+    embedding_function,            # function mapping row to embedding
+    verbose=True,                  # show console output
+    use_float32=True,              # use float32 arrays
+    n_jobs=-1,                     # parallel jobs for sklearn KNN
+    plot_knee=False                # visualize knee-point detection
 )
 ```
 
-### Graph Building Pipeline
+**Parameters**
 
-1. **KNN + MST Graph**: Creates initial graph using k-nearest neighbors in embedding space and ensures connectivity with a minimum spanning tree
-2. **Pruning**: Removes edges with distances above a threshold (determined automatically by knee-point detection or user-specified)
-3. **Smoothing**: Adds edges between 2-hop neighbors to improve graph structure
-4. **Iterative Refinement**: Alternates between pruning and smoothing to optimize graph structure
+* `n_neighbors` (int): number of neighbors in initial KNN graph
+* `mst_iterations` (int): number of refine-MST passes
+* `polish_iterations` (int): number of prune→polish loops
+* `prune_threshold` (float or None): distance cutoff (None = auto)
+* `kneedle_sensitivity` (float): controls threshold detection
+* `max_new_edges` (int or None): limit on 2-hop polishing edges
+* `preserve_mst` (bool): whether to keep MST edges through pruning
 
-### Output
+## Graph Building Pipeline
 
-- **DataGraph object**: Contains the sparse graph matrix and associated metadata
-- **Results dictionary**: Contains detailed statistics, component information, and timing data
+1. **KNN + MST**: Build KNN with `n_neighbors` in embedding space, then refine via MST scans
+2. **Prune**: Remove edges above `prune_threshold` (auto-detected via kneedle)
+3. **Polish**: Add edges between 2-hop neighbors, up to `max_new_edges`
+4. **Iterate**: Alternate steps 2 & 3, for `polish_iterations`
 
-## Optimization Considerations
+## Output
 
-The code includes several performance optimizations:
+* **`DataGraph` object**: holds `graph` (CSR), `component_labels`, and metadata
+* **`results` dict**: includes original edge data, component sizes, history, and timing stats
 
-- Numba-accelerated distance computations
-- Batch processing for memory efficiency
-- Efficient graph algorithms (MST, connected components)
-- Memory usage estimation for optimal batch sizing
-- Tracking of MST edges to maintain connectivity
-- Early stopping when graph structure stabilizes
+## Advanced Usage
 
-## Dependencies
+### Custom Premetrics
 
-- numpy
-- scipy
-- pandas
-- scikit-learn
-- numba
-- matplotlib (for optional visualization)
+Your premetric function signature must be:
+
+```python
+@njit(parallel=True)
+def distance_fn(features: np.ndarray, i_indices: np.ndarray, j_indices: np.ndarray) -> np.ndarray:
+    # returns array of distances
+    ...
+```
+
+### Controlling Density
+
+```python
+# Sparser graph
+graph_obj, results = generator.build_and_refine_graph(
+    n_neighbors=10,
+    prune_threshold=0.3,
+    kneedle_sensitivity=2.0,
+    max_new_edges=200
+)
+
+# Denser graph
+graph_obj, results = generator.build_and_refine_graph(
+    n_neighbors=50,
+    prune_threshold=None,
+    kneedle_sensitivity=0.5,
+    max_new_edges=None
+)
+```
 
 ## Installation
 
@@ -118,39 +147,11 @@ The code includes several performance optimizations:
 pip install data-graph
 ```
 
-## Advanced Usage
+## Dependencies
 
-### Custom Distance Functions
-
-The semimetric weight function must be Numba-compatible and have the signature:
-
-```python
-@njit(parallel=True)
-def distance_function(features, i_indices, j_indices):
-    # features: np.array of shape (n_samples, n_features)
-    # i_indices, j_indices: arrays of node indices to compute distances between
-    # return: array of distances with same length as i_indices
-    ...
-```
-
-### Controlling Graph Density
-
-Adjust these parameters to control graph density:
-
-```python
-# Sparser graph
-graph_obj, results = generator.build_and_refine_graph(
-    n_neighbors=15,              # Fewer initial neighbors
-    prune_threshold=0.5,         # Lower threshold removes more edges
-    kneedle_sensitivity=1.5,     # Higher sensitivity finds knee point earlier
-    max_new_edges=1000           # Limit number of 2-hop connections
-)
-
-# Denser graph
-graph_obj, results = generator.build_and_refine_graph(
-    n_neighbors=50,              # More initial neighbors
-    prune_threshold=None,        # Auto-detect threshold
-    kneedle_sensitivity=0.5,     # Lower sensitivity finds knee point later
-    max_new_edges=None           # No limit on 2-hop connections
-)
-```
+* `numpy`
+* `scipy`
+* `pandas`
+* `scikit-learn`
+* `numba`
+* `matplotlib` (optional)

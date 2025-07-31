@@ -1,5 +1,5 @@
 """
-DataGraphGenerator - Creates and refines a sparse graph over data according to a semimetric weight function
+DataGraphGenerator - Creates and refines a sparse graph over data according to a premetric weight function
 Optimized version with array-based edge storage and in-place operations
 """
 import numpy as np
@@ -135,48 +135,99 @@ def boruvka_mst_parallel(n, rows, cols, weights):
             break
     return selected
 
+@njit
+def extract_upper_triangle_edges_from_csr_numba(indptr, indices, data, n):
+    """
+    Numba-accelerated extraction of upper-triangle edges from CSR.
+    Returns (rows, cols, weights) as numpy arrays.
+    """
+    # Count edges first
+    edge_count = 0
+    for i in range(n):
+        for j_idx in range(indptr[i], indptr[i+1]):
+            j = indices[j_idx]
+            if i < j:
+                edge_count += 1
+    
+    # Allocate output arrays
+    rows = np.empty(edge_count, dtype=np.int32)
+    cols = np.empty(edge_count, dtype=np.int32)
+    weights = np.empty(edge_count, dtype=data.dtype)
+    
+    # Fill arrays
+    edge_idx = 0
+    for i in range(n):
+        for j_idx in range(indptr[i], indptr[i+1]):
+            j = indices[j_idx]
+            if i < j:
+                rows[edge_idx] = i
+                cols[edge_idx] = j
+                weights[edge_idx] = data[j_idx]
+                edge_idx += 1
+                
+    return rows, cols, weights
+
 def extract_upper_triangle_edges_from_csr(graph):
     """
-    Extract upper-triangle edge arrays from CSR matrix.
+    Extract upper-triangle edge arrays from CSR matrix using numba acceleration.
     Returns (rows, cols, weights) as numpy int32/float arrays.
     """
-    indptr = graph.indptr
-    indices = graph.indices
-    data = graph.data
-    n = graph.shape[0]
+    return extract_upper_triangle_edges_from_csr_numba(
+        graph.indptr, graph.indices, graph.data, graph.shape[0]
+    )
 
-    # Build row indices for nonzero entries
-    counts = indptr[1:] - indptr[:-1]
-    rows = np.repeat(np.arange(n, dtype=np.int32), counts)
-    cols = indices.astype(np.int32)
-
-    # Filter upper triangle
-    mask = rows < cols
-    return rows[mask], cols[mask], data[mask]
+@njit
+def extract_all_edges_from_csr_numba(indptr, indices, data, n, upper_only):
+    """
+    Numba-accelerated extraction of edges from CSR.
+    Returns edge_arr (n_edges, 2) and weights array.
+    """
+    if upper_only:
+        # Count upper triangle edges
+        edge_count = 0
+        for i in range(n):
+            for j_idx in range(indptr[i], indptr[i+1]):
+                j = indices[j_idx]
+                if i < j:
+                    edge_count += 1
+        
+        # Allocate output arrays
+        edge_arr = np.empty((edge_count, 2), dtype=np.int32)
+        weights = np.empty(edge_count, dtype=data.dtype)
+        
+        # Fill arrays
+        edge_idx = 0
+        for i in range(n):
+            for j_idx in range(indptr[i], indptr[i+1]):
+                j = indices[j_idx]
+                if i < j:
+                    edge_arr[edge_idx, 0] = i
+                    edge_arr[edge_idx, 1] = j
+                    weights[edge_idx] = data[j_idx]
+                    edge_idx += 1
+    else:
+        # All edges
+        edge_count = len(data)
+        edge_arr = np.empty((edge_count, 2), dtype=np.int32)
+        weights = data.copy()
+        
+        edge_idx = 0
+        for i in range(n):
+            for j_idx in range(indptr[i], indptr[i+1]):
+                edge_arr[edge_idx, 0] = i
+                edge_arr[edge_idx, 1] = indices[j_idx]
+                edge_idx += 1
+                
+    return edge_arr, weights
 
 def extract_all_edges_from_csr(graph, upper_only=True):
     """
     Extract edges directly from CSR without converting to COO.
     Returns edge_arr (n_edges, 2) and weights array.
     """
-    indptr = graph.indptr
-    indices = graph.indices
-    data = graph.data
-    n = graph.shape[0]
-
-    # build full (row, col) arrays
-    rows = np.repeat(np.arange(n, dtype=np.int32), indptr[1:] - indptr[:-1])
-    cols = indices.astype(np.int32)
-
-    # optionally keep only i<j
-    if upper_only:
-        mask = rows < cols
-        rows = rows[mask]
-        cols = cols[mask]
-        data = data[mask]
-
-    edge_arr = np.stack([rows, cols], axis=1)
-    return edge_arr, data
+    return extract_all_edges_from_csr_numba(
+        graph.indptr, graph.indices, graph.data, graph.shape[0], upper_only
+    )
 
     
 class DataGraphGenerator:
@@ -391,7 +442,7 @@ class DataGraphGenerator:
     def extract_mst_edges_boruvka(self, graph, n):
         """
         Extract MST edges via streaming Borůvka MST (avoids CSR->CSC conversion).
-        Returns a set of (i, j) tuples with i < j.
+        Returns a boolean mask array aligned with the graph's upper triangle edges.
         """
         self.timing.start("extract_mst_edges")
     
@@ -401,17 +452,8 @@ class DataGraphGenerator:
         # 2) Compute MST mask
         selected = boruvka_mst_parallel(n, rows, cols, weights)
     
-        # 3) Gather selected edges
-        idxs = np.nonzero(selected)[0]
-        u = rows[idxs]; v = cols[idxs]
-    
-        # 4) Normalize ordering and build set
-        min_uv = np.minimum(u, v)
-        max_uv = np.maximum(u, v)
-        mst_edges = set(zip(min_uv.tolist(), max_uv.tolist()))
-    
         self.timing.end("extract_mst_edges")
-        return mst_edges
+        return selected, rows, cols
         
     def create_knn_graph_with_mst(self, 
                                   n_neighbors=30, 
@@ -427,6 +469,9 @@ class DataGraphGenerator:
         Parameters:
         -----------
         """
+        # Initialize scale_factor early
+        scale_factor = 1.0
+        
         self.timing.start("create_knn_graph_with_mst")
         node_df = self.node_df
         embedding_function = self.embedding_function
@@ -577,37 +622,14 @@ class DataGraphGenerator:
         self.timing.start("create_knn_graph_with_mst.initialize_edge_tracking")
         print("Extracting upper‑triangle edges directly from CSR buffers...")
         
-        # Number of nodes
-        n = G_knn.shape[0]
-        
-        # Grab the CSR arrays
-        indptr  = G_knn.indptr       # shape (n+1,)
-        indices = G_knn.indices      # shape (nnz,)
-        data    = G_knn.data         # shape (nnz,)
-        
-        # Compute row index for each stored value
-        row_counts = indptr[1:] - indptr[:-1]              # shape (n,)
-        rows       = np.repeat(np.arange(n), row_counts)   # shape (nnz,)
-        cols       = indices.copy()                        # shape (nnz,)
-        vals       = data.copy()                           # shape (nnz,)
-        
-        # Keep only one direction (i < j)
-        mask = rows < cols
-        rows = rows[mask]
-        cols = cols[mask]
-        vals = vals[mask]
-        
-        # How many unique edges?
-        n_edges = len(rows)
+        # Use the optimized extraction function
+        edge_arr, euclidean_distances_list = extract_all_edges_from_csr(G_knn, upper_only=True)
+        n_edges = len(edge_arr)
         print(f"Tracking {n_edges} unique edges from CSR")
-        
-        # Create edge array - OPTIMIZATION B.5
-        edge_arr = np.stack([rows.astype(np.int32), cols.astype(np.int32)], axis=1)  # shape (n_edges, 2)
         
         # Pre‐allocate all trackers at once
         dtype = np.float32 if self.use_float32 else np.float64
         graph_distances          = np.zeros(n_edges, dtype=dtype)
-        euclidean_distances_list = vals.astype(dtype)
         graph_distance_computed  = np.zeros(n_edges, dtype=bool)
         is_mst_edge              = np.zeros(n_edges, dtype=bool)
         is_valid_edge            = np.ones(n_edges, dtype=bool)
@@ -765,23 +787,29 @@ class DataGraphGenerator:
                 # Extract MST from hybrid graph
                 if force_mst:
                     self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
-                    mst_edges = self.extract_mst_edges_boruvka(hybrid_graph, n)
+                    mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(hybrid_graph, n)
                     self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
                     
-                    # Update MST edge flags efficiently
+                    # Update MST edge flags efficiently using the returned mask
                     self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.identify_mst_edges")
                     
-                    # Normalize edges to match MST format (ensure i < j)
-                    min_indices = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
-                    max_indices = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
+                    # Create a mapping from upper triangle edges to the full edge array
+                    # First normalize all edges in edge_arr to ensure i < j
+                    edge_i = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
+                    edge_j = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
                     
-                    # Vectorized MST edge identification
-                    is_mst_edge = np.array([
-                        (i, j) in mst_edges
-                        for i, j in zip(min_indices, max_indices)
-                    ], dtype=bool)
+                    # Build edge to index mapping using a dictionary
+                    edge_to_idx = {(i, j): idx for idx, (i, j) in enumerate(zip(edge_i, edge_j))}
+                    
+                    # Map MST edges to the full edge array
+                    mst_edge_indices = np.where(mst_mask)[0]
+                    for idx in mst_edge_indices:
+                        edge = (mst_rows[idx], mst_cols[idx])
+                        if edge in edge_to_idx:
+                            is_mst_edge[edge_to_idx[edge]] = True
                     
                     self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.identify_mst_edges")
+                    
                     # Report MST diameters if requested
                     if report_mst_diameters:
                         # Calculate MST diameter using unscaled graph distances
@@ -869,7 +897,7 @@ class DataGraphGenerator:
                                max_components=None, use_median_filter=True, preserve_mst=True):
         """
         Prune a graph by removing edges with distances above a threshold.
-        Now uses in-place edge removal (B.6 optimization).
+        Now uses in-place edge removal (B.6 optimization) and direct MST mask.
         
         NOTE: Edges that exceed the threshold are already removed during computation,
         so this method primarily handles automatic threshold detection and additional pruning.
@@ -943,9 +971,9 @@ class DataGraphGenerator:
         if self.verbose:
             print(f"[Pruning] Pruning graph edges by threshold")
         
-        # If we're preserving the MST, use the is_mst_edge flag if available
+        # If we're preserving the MST, get the MST edge mask
         self.timing.start("prune_graph_by_threshold.prepare_mst")
-        mst_edges = set()
+        mst_edge_mask = None
         if preserve_mst:
             if threshold is not None:
                 # 1) Build mask of edges to keep
@@ -960,26 +988,53 @@ class DataGraphGenerator:
                 if check_graph_connectivity(pruned):
                     if self.verbose:
                         print("         Pruned graph stays connected—no MST edges lost")
-                    # leave mst_edges empty
+                    # Use existing MST edge information if available
+                    if edge_data.get('mst_computed') and 'is_mst_edge' in edge_data:
+                        mst_edge_mask = edge_data['is_mst_edge']
                 else:
                     if self.verbose:
                         print("         Pruned graph is disconnected—recomputing MST")
-                    mst_edges = self.extract_mst_edges_boruvka(graph, n)
+                    # Compute MST and get the boolean mask directly
+                    mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(graph, n)
+                    
+                    # Map MST mask to edge_arr indices
+                    edge_i = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
+                    edge_j = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
+                    edge_to_idx = {(i, j): idx for idx, (i, j) in enumerate(zip(edge_i, edge_j))}
+                    
+                    mst_edge_mask = np.zeros(len(edge_arr), dtype=bool)
+                    mst_edge_indices = np.where(mst_mask)[0]
+                    for idx in mst_edge_indices:
+                        edge = (mst_rows[idx], mst_cols[idx])
+                        if edge in edge_to_idx:
+                            mst_edge_mask[edge_to_idx[edge]] = True
         
             else:
                 # No threshold ⇒ automatic pruning; always ensure MST
-                if edge_data.get('mst_computed') and np.any(edge_data.get('is_mst_edge', [])):
-                    idxs = np.where(edge_data['is_mst_edge'])[0]
-                    mst_edges = {tuple(edge_arr[i]) for i in idxs}
+                if edge_data.get('mst_computed') and 'is_mst_edge' in edge_data:
+                    mst_edge_mask = edge_data['is_mst_edge']
                     if self.verbose:
-                        print(f"         Using precomputed MST ({len(mst_edges)} edges)")
+                        print(f"         Using precomputed MST ({np.sum(mst_edge_mask)} edges)")
                 else:
                     if self.verbose:
                         print("         Computing MST edges for automatic threshold pruning")
-                    mst_edges = self.extract_mst_edges_boruvka(graph, n)
+                    # Compute MST and get the boolean mask directly
+                    mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(graph, n)
+                    
+                    # Map MST mask to edge_arr indices
+                    edge_i = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
+                    edge_j = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
+                    edge_to_idx = {(i, j): idx for idx, (i, j) in enumerate(zip(edge_i, edge_j))}
+                    
+                    mst_edge_mask = np.zeros(len(edge_arr), dtype=bool)
+                    mst_edge_indices = np.where(mst_mask)[0]
+                    for idx in mst_edge_indices:
+                        edge = (mst_rows[idx], mst_cols[idx])
+                        if edge in edge_to_idx:
+                            mst_edge_mask[edge_to_idx[edge]] = True
         
-            if self.verbose and mst_edges:
-                print(f"         Preserving {len(mst_edges)} MST edges to maintain connectivity")
+            if self.verbose and mst_edge_mask is not None:
+                print(f"         Preserving {np.sum(mst_edge_mask)} MST edges to maintain connectivity")
         else:
             if self.verbose:
                 print("         MST preservation disabled—pruning without connectivity guarantee")
@@ -1009,9 +1064,10 @@ class DataGraphGenerator:
         
         # Filter out MST edges from consideration for pruning
         self.timing.start("prune_graph_by_threshold.filter_prunable")
-        if preserve_mst:
-            # Vectorized MST edge checking
-            prunable_mask = np.array([tuple(edge) not in mst_edges for edge in sorted_edges])
+        if preserve_mst and mst_edge_mask is not None:
+            # Use the boolean mask directly
+            sorted_mst_mask = mst_edge_mask[sorted_indices]
+            prunable_mask = ~sorted_mst_mask
             prunable_edges = sorted_edges[prunable_mask]
             prunable_distances = sorted_distances[prunable_mask]
             
@@ -1200,18 +1256,6 @@ class DataGraphGenerator:
                 expected_mst_edges = n - 1
                 if mst_edge_count != expected_mst_edges:
                     print(f"         WARNING: After pruning, found {mst_edge_count} MST edges, expected {expected_mst_edges}")
-                    
-                    # Double-check which MST edges are missing
-                    if mst_edge_count < expected_mst_edges:
-                        missing_count = 0
-                        pruned_edge_set = set(map(tuple, pruned_edge_arr))
-                        for edge in mst_edges:
-                            if edge not in pruned_edge_set:
-                                missing_count += 1
-                                if missing_count <= 5:  # Only show up to 5 missing edges
-                                    print(f"         Missing MST edge: {edge}")
-                        if missing_count > 5:
-                            print(f"         ... and {missing_count - 5} more missing MST edges")
         self.timing.end("prune_graph_by_threshold.verify")
         self.timing.end("prune_graph_by_threshold")
         
@@ -1400,19 +1444,25 @@ class DataGraphGenerator:
         
         # Get the MST edges for this graph if we have MST info
         if has_mst_info:
-            # Extract MST edges from original edge data
-            original_mst_edges = set()
-            for i, is_mst in enumerate(edge_data['is_mst_edge']):
-                if is_mst:
-                    original_mst_edges.add(tuple(edge_arr[i]))
+            # Use existing MST information from edge_data
+            original_mst_mask = edge_data['is_mst_edge']
+            original_mst_count = np.sum(original_mst_mask)
             
             # Verify we have the right number of MST edges
             expected_mst_edges = n - 1
-            if len(original_mst_edges) != expected_mst_edges:
+            if original_mst_count != expected_mst_edges:
                 if self.verbose:
-                    print(f"         WARNING: Original MST has {len(original_mst_edges)} edges, expected {expected_mst_edges}")
+                    print(f"         WARNING: Original MST has {original_mst_count} edges, expected {expected_mst_edges}")
                 # If we don't have the right number, recompute
-                original_mst_edges = self.extract_mst_edges_boruvka(graph, n)
+                mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(graph, n)
+                # Create a set for comparison later
+                original_mst_edges = set(zip(mst_rows[mst_mask], mst_cols[mst_mask]))
+            else:
+                # Create a set from the existing MST edges
+                original_mst_edges = set()
+                for idx, is_mst in enumerate(original_mst_mask):
+                    if is_mst:
+                        original_mst_edges.add(tuple(edge_arr[idx]))
         
         # Extract edges from smoothed graph directly without COO conversion
         smoothed_edge_arr, smoothed_weights = extract_all_edges_from_csr(smoothed_graph, upper_only=True)
@@ -1458,18 +1508,6 @@ class DataGraphGenerator:
                 expected_mst_edges = n - 1
                 if mst_edge_count != expected_mst_edges:
                     print(f"         WARNING: Smoothed graph has {mst_edge_count} MST edges, expected {expected_mst_edges}")
-                    
-                    # Check if any MST edges are missing
-                    if mst_edge_count < expected_mst_edges:
-                        smoothed_edge_set = set(map(tuple, smoothed_edge_arr))
-                        missing_count = 0
-                        for edge in original_mst_edges:
-                            if edge not in smoothed_edge_set:
-                                missing_count += 1
-                                if missing_count <= 5:  # Only show up to 5 missing edges
-                                    print(f"         Missing MST edge: {edge}")
-                        if missing_count > 5:
-                            print(f"         ... and {missing_count - 5} more missing MST edges")
         self.timing.end("smooth_graph_with_2hop.verify")
         
         self.timing.end("smooth_graph_with_2hop")
@@ -1626,7 +1664,7 @@ class DataGraphGenerator:
                           polish_iterations=2, max_new_edges=None, batch_size=None,
                           max_components=None, use_median_filter=True, 
                           smooth_before_prune=False, preserve_mst=True,
-                          log_timing=True, missing_weight=np.inf):
+                          log_timing=True, missing_weight=np.inf, use_approximate_nn=False):
         """
         Full pipeline to build and refine the DataGraph object with detailed timing statistics
         
@@ -1640,6 +1678,8 @@ class DataGraphGenerator:
             Function that takes a DataFrame row and returns embedding coordinates
         n_neighbors : int, default=30
             Number of neighbors for KNN graph
+        use_approximate_nn : bool, default=False
+            Whether to use approximate nearest neighbor search (nmslib)
         ...
         """
         t0 = time.time()
@@ -1670,7 +1710,8 @@ class DataGraphGenerator:
         mst_graph, edge_data = self.create_knn_graph_with_mst(
             n_neighbors=n_neighbors,
             max_iterations=mst_iterations,
-            batch_size=batch_size
+            batch_size=batch_size,
+            use_approximate_nn=use_approximate_nn
         )
         self.timing.end("step1_knn_mst")
         step1_time = time.time()-t1
