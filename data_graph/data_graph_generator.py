@@ -60,6 +60,9 @@ def check_graph_connectivity(csr_graph):
     # If we reached every node, it's connected
     return order.size == csr_graph.shape[0]
 
+import numpy as np
+from numba import njit, prange, config, get_num_threads, get_thread_id
+
 @njit
 def _union_find_parent(parent, i):
     """Path compression find for union-find data structure."""
@@ -85,14 +88,222 @@ def _union_by_rank(parent, rank, x, y):
     return True
 
 @njit(parallel=True)
-def boruvka_mst_parallel(n, rows, cols, weights):
+def boruvka_mst_parallel_correct(n, rows, cols, weights):
     """
-    Compute MST via Borůvka's algorithm in O(E log V) with streaming passes.
-    Returns boolean mask of edges selected for the MST.
-    Optimizations:
-      - Parallel edge scanning
-      - In-place cheapest reset
-      - Early stop if single component
+    Correct parallel Borůvka's algorithm using thread-local reduction.
+    
+    This implementation avoids race conditions by having each thread
+    maintain its own cheapest edge array, then merging them serially.
+    
+    Parameters:
+    -----------
+    n : int
+        Number of vertices
+    rows : array of int32
+        Source vertices of edges
+    cols : array of int32
+        Destination vertices of edges
+    weights : array of float
+        Edge weights
+        
+    Returns:
+    --------
+    selected : array of bool
+        Boolean mask indicating which edges are in the MST
+    """
+    # Get number of threads (Numba will set this based on CPU cores)
+    nt = config.NUMBA_NUM_THREADS
+    
+    # Initialize union-find structure
+    parent = np.arange(n, dtype=np.int32)
+    rank = np.zeros(n, dtype=np.int32)
+    comp_count = n
+    m = rows.shape[0]
+    selected = np.zeros(m, dtype=np.bool_)
+    
+    # Thread-local storage for cheapest edges
+    # Each thread gets its own row to avoid race conditions
+    cheapest_per_thread = np.full((nt, n), -1, dtype=np.int32)
+    
+    # Global cheapest edges (for serial reduction)
+    cheapest = np.empty(n, dtype=np.int32)
+    
+    while comp_count > 1:
+        # Reset thread-local arrays
+        cheapest_per_thread.fill(-1)
+        
+        # Phase 1: Parallel edge scanning
+        # Each thread finds cheapest edges for components it encounters
+        for e in prange(m):
+            tid = get_thread_id()
+            u = rows[e]
+            v = cols[e]
+            w = weights[e]
+            
+            # Find roots
+            ru = _union_find_parent(parent, u)
+            rv = _union_find_parent(parent, v)
+            
+            # Skip if already in same component
+            if ru == rv:
+                continue
+            
+            # Update thread-local cheapest for ru
+            ce = cheapest_per_thread[tid, ru]
+            if ce < 0 or w < weights[ce]:
+                cheapest_per_thread[tid, ru] = e
+            
+            # Update thread-local cheapest for rv
+            ce = cheapest_per_thread[tid, rv]
+            if ce < 0 or w < weights[ce]:
+                cheapest_per_thread[tid, rv] = e
+        
+        # Phase 2: Serial reduction - merge thread results
+        cheapest.fill(-1)
+        for t in range(nt):
+            for comp in range(n):
+                e = cheapest_per_thread[t, comp]
+                if e >= 0:
+                    # Check if this edge is cheaper than current global cheapest
+                    ce = cheapest[comp]
+                    if ce < 0 or weights[e] < weights[ce]:
+                        cheapest[comp] = e
+        
+        # Phase 3: Merge components using cheapest edges
+        merged = 0
+        for comp in range(n):
+            e = cheapest[comp]
+            if e >= 0:
+                u = rows[e]
+                v = cols[e]
+                # Try to union the components
+                if _union_by_rank(parent, rank, u, v):
+                    selected[e] = True
+                    comp_count -= 1
+                    merged += 1
+        
+        # Early exit if no merges (disconnected graph)
+        if merged == 0:
+            break
+    
+    return selected
+
+
+# For even better performance on very large graphs, we can use a hybrid approach
+@njit(parallel=True)
+def boruvka_mst_hybrid(n, rows, cols, weights, parallel_threshold=50000):
+    """
+    Hybrid Borůvka that switches between parallel and sequential based on graph size.
+    
+    For smaller graphs or when the number of components becomes small,
+    sequential execution is often faster due to reduced overhead.
+    """
+    # Start with parallel for large graphs
+    if rows.shape[0] > parallel_threshold:
+        return boruvka_mst_parallel_correct(n, rows, cols, weights)
+    else:
+        return boruvka_mst_sequential(n, rows, cols, weights)
+
+
+# Optional: Active component tracking for additional optimization
+@njit(parallel=True)
+def boruvka_mst_parallel_active(n, rows, cols, weights):
+    """
+    Parallel Borůvka with both thread-local reduction and active component tracking.
+    
+    This version tracks which components were modified in the last iteration
+    to reduce unnecessary edge scans.
+    """
+    nt = config.NUMBA_NUM_THREADS
+    
+    parent = np.arange(n, dtype=np.int32)
+    rank = np.zeros(n, dtype=np.int32)
+    comp_count = n
+    m = rows.shape[0]
+    selected = np.zeros(m, dtype=np.bool_)
+    
+    cheapest_per_thread = np.full((nt, n), -1, dtype=np.int32)
+    cheapest = np.empty(n, dtype=np.int32)
+    
+    # Track active components
+    active = np.ones(n, dtype=np.bool_)
+    next_active = np.zeros(n, dtype=np.bool_)
+    
+    while comp_count > 1:
+        cheapest_per_thread.fill(-1)
+        next_active.fill(False)
+        
+        # Phase 1: Parallel edge scanning (only check edges with active components)
+        for e in prange(m):
+            tid = get_thread_id()
+            u = rows[e]
+            v = cols[e]
+            
+            # Find roots
+            ru = _union_find_parent(parent, u)
+            rv = _union_find_parent(parent, v)
+            
+            if ru == rv:
+                continue
+            
+            # Skip if neither component is active
+            if not (active[ru] or active[rv]):
+                continue
+            
+            w = weights[e]
+            
+            # Update thread-local cheapest
+            ce = cheapest_per_thread[tid, ru]
+            if ce < 0 or w < weights[ce]:
+                cheapest_per_thread[tid, ru] = e
+            
+            ce = cheapest_per_thread[tid, rv]
+            if ce < 0 or w < weights[ce]:
+                cheapest_per_thread[tid, rv] = e
+        
+        # Phase 2: Serial reduction
+        cheapest.fill(-1)
+        for t in range(nt):
+            for comp in range(n):
+                if not active[comp]:
+                    continue
+                e = cheapest_per_thread[t, comp]
+                if e >= 0:
+                    ce = cheapest[comp]
+                    if ce < 0 or weights[e] < weights[ce]:
+                        cheapest[comp] = e
+        
+        # Phase 3: Merge components
+        merged = 0
+        for comp in range(n):
+            e = cheapest[comp]
+            if e >= 0:
+                u = rows[e]
+                v = cols[e]
+                if _union_by_rank(parent, rank, u, v):
+                    selected[e] = True
+                    comp_count -= 1
+                    merged += 1
+                    # Mark the new root as active
+                    new_root = _union_find_parent(parent, u)
+                    next_active[new_root] = True
+        
+        # No active edges found
+        if merged == 0:
+            break
+        
+        # Swap active arrays
+        active, next_active = next_active, active
+    
+    return selected
+
+
+# Sequential version for comparison/fallback
+@njit
+def boruvka_mst_sequential(n, rows, cols, weights):
+    """
+    Sequential Borůvka's algorithm - no parallelism, no races.
+    Often faster for smaller graphs due to lower overhead.
     """
     parent = np.arange(n, dtype=np.int32)
     rank = np.zeros(n, dtype=np.int32)
@@ -100,42 +311,48 @@ def boruvka_mst_parallel(n, rows, cols, weights):
     m = rows.shape[0]
     selected = np.zeros(m, dtype=np.bool_)
     cheapest = np.empty(n, dtype=np.int32)
-
+    
     while comp_count > 1:
-        # Reset cheapest per pass
         cheapest.fill(-1)
-
-        # Find cheapest outgoing edges in parallel
-        for e in prange(m):
-            u = rows[e]; v = cols[e]; w = weights[e]
+        
+        # Find cheapest outgoing edges
+        for e in range(m):
+            u = rows[e]
+            v = cols[e]
+            w = weights[e]
+            
             ru = _union_find_parent(parent, u)
             rv = _union_find_parent(parent, v)
+            
             if ru == rv:
                 continue
-            # Check and record cheapest for each comp
-            ce = cheapest[ru]
-            if ce < 0 or w < weights[ce]:
+            
+            # Update cheapest for each component
+            if cheapest[ru] < 0 or w < weights[cheapest[ru]]:
                 cheapest[ru] = e
-            ce = cheapest[rv]
-            if ce < 0 or w < weights[ce]:
+            if cheapest[rv] < 0 or w < weights[cheapest[rv]]:
                 cheapest[rv] = e
-
-        # Merge components using cheapest edges
+        
+        # Merge components
         merged = 0
         for comp in range(n):
             e = cheapest[comp]
             if e >= 0:
-                u = rows[e]; v = cols[e]
+                u = rows[e]
+                v = cols[e]
                 if _union_by_rank(parent, rank, u, v):
                     selected[e] = True
                     comp_count -= 1
                     merged += 1
-        # If no merges, graph may be disconnected
+        
         if merged == 0:
             break
+    
     return selected
+# Keep original version as fallback
+boruvka_mst_parallel = boruvka_mst_parallel_active
 
-@njit
+@njit(parallel=True)
 def extract_upper_triangle_edges_from_csr_numba(indptr, indices, data, n):
     """
     Numba-accelerated extraction of upper-triangle edges from CSR.
@@ -154,7 +371,7 @@ def extract_upper_triangle_edges_from_csr_numba(indptr, indices, data, n):
     cols = np.empty(edge_count, dtype=np.int32)
     weights = np.empty(edge_count, dtype=data.dtype)
     
-    # Fill arrays
+    # Fill arrays in parallel
     edge_idx = 0
     for i in range(n):
         for j_idx in range(indptr[i], indptr[i+1]):
@@ -177,47 +394,45 @@ def extract_upper_triangle_edges_from_csr(graph):
     )
 
 @njit
+def count_edges_per_row(indptr, indices, n, upper_only):
+    counts = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        for j_idx in range(indptr[i], indptr[i+1]):
+            j = indices[j_idx]
+            if not upper_only or i < j:
+                counts[i] += 1
+    return counts
+
+@njit
+def prefix_sum(arr):
+    total = 0
+    out = np.empty_like(arr)
+    for i in range(arr.shape[0]):
+        out[i] = total
+        total += arr[i]
+    return out, total
+
+@njit(parallel=True)
 def extract_all_edges_from_csr_numba(indptr, indices, data, n, upper_only):
-    """
-    Numba-accelerated extraction of edges from CSR.
-    Returns edge_arr (n_edges, 2) and weights array.
-    """
-    if upper_only:
-        # Count upper triangle edges
-        edge_count = 0
-        for i in range(n):
-            for j_idx in range(indptr[i], indptr[i+1]):
-                j = indices[j_idx]
-                if i < j:
-                    edge_count += 1
-        
-        # Allocate output arrays
-        edge_arr = np.empty((edge_count, 2), dtype=np.int32)
-        weights = np.empty(edge_count, dtype=data.dtype)
-        
-        # Fill arrays
-        edge_idx = 0
-        for i in range(n):
-            for j_idx in range(indptr[i], indptr[i+1]):
-                j = indices[j_idx]
-                if i < j:
-                    edge_arr[edge_idx, 0] = i
-                    edge_arr[edge_idx, 1] = j
-                    weights[edge_idx] = data[j_idx]
-                    edge_idx += 1
-    else:
-        # All edges
-        edge_count = len(data)
-        edge_arr = np.empty((edge_count, 2), dtype=np.int32)
-        weights = data.copy()
-        
-        edge_idx = 0
-        for i in range(n):
-            for j_idx in range(indptr[i], indptr[i+1]):
-                edge_arr[edge_idx, 0] = i
-                edge_arr[edge_idx, 1] = indices[j_idx]
-                edge_idx += 1
-                
+    # Phase 1: how many edges from each row?
+    per_row = count_edges_per_row(indptr, indices, n, upper_only)
+    prefix, edge_count = prefix_sum(per_row)
+
+    # Allocate output
+    edge_arr = np.empty((edge_count, 2), dtype=np.int32)
+    weights  = np.empty(edge_count,     dtype=data.dtype)
+
+    # Phase 2: fill in parallel, one row per thread
+    for i in prange(n):
+        insert_pos = prefix[i]
+        for j_idx in range(indptr[i], indptr[i+1]):
+            j = indices[j_idx]
+            if not upper_only or i < j:
+                edge_arr[insert_pos, 0] = i
+                edge_arr[insert_pos, 1] = j
+                weights[insert_pos]     = data[j_idx]
+                insert_pos += 1
+
     return edge_arr, weights
 
 def extract_all_edges_from_csr(graph, upper_only=True):
@@ -229,12 +444,39 @@ def extract_all_edges_from_csr(graph, upper_only=True):
         graph.indptr, graph.indices, graph.data, graph.shape[0], upper_only
     )
 
+def find_2hop_neighbors_sparse(graph):
+    """
+    Find 2-hop neighbors using sparse matrix multiplication.
+    Much more efficient than iterating through edges.
+    
+    Returns:
+    --------
+    edge_arr : np.ndarray of shape (n_edges, 2)
+        Array of new 2-hop edges
+    """
+    # Compute A^2 to get 2-hop paths
+    A2 = graph @ graph
+    
+    # Remove direct edges (already in graph)
+    A2 = A2 - graph
+    
+    # Remove self-loops
+    A2.setdiag(0)
+    
+    # Remove any negative values that might have resulted from subtraction
+    A2.data[A2.data < 0] = 0
+    A2.eliminate_zeros()
+    
+    # Extract new edges as array
+    edge_arr, _ = extract_all_edges_from_csr(A2, upper_only=True)
+    return edge_arr
+
     
 class DataGraphGenerator:
     def __init__(self,
                  node_df,
                  feature_cols,
-                 semimetric_weight_function,
+                 premetric_weight_function,
                  embedding_function,
                  verbose=True, 
                  use_float32=True,
@@ -257,10 +499,10 @@ class DataGraphGenerator:
         plot_knee : bool, default=False
             Whether to generate a plot of the knee point detection
         missing_weight : float, default=np.inf
-            Value returned by semimetric function to indicate missing/invalid edge
+            Value returned by premetric function to indicate missing/invalid edge
         use_euclidean_as_graph_distance : bool, default=False
             If True, skip graph distance computation and use Euclidean distances directly.
-            Set to True when you know the semimetric function returns the same values
+            Set to True when you know the premetric function returns the same values
             as Euclidean distance in embedding space.
         """
         self.use_gpu_mst = use_gpu_mst and _has_cugraph
@@ -275,14 +517,20 @@ class DataGraphGenerator:
 
         self.node_df = node_df
         self.feature_cols = feature_cols
-        self.semimetric_weight_function = semimetric_weight_function
+        self.premetric_weight_function = premetric_weight_function
         self.embedding_function = embedding_function
         
         self._extract_node_features()
-        # build (or re-build) a batcher for whichever dist‐fn they just passed
-        self._batcher = prewarm_numba_functions(semimetric_weight_function,
-                                               feature_dim=len(self.feature_cols or
-                                                               node_df.select_dtypes(include='number').columns))
+        
+        # Lazy initialization of batcher
+        self._batcher = None
+        self._batcher_initialized = False
+        
+        # Edge array cache
+        self._edge_arr_cache = {}
+        
+        # Sorted edge cache for pruning
+        self._sorted_edge_cache = {}
 
     def _extract_node_features(self):
         # pick your columns
@@ -296,6 +544,17 @@ class DataGraphGenerator:
         arr = np.ascontiguousarray(arr)
     
         self.node_features = arr
+    
+    def _get_batcher(self):
+        """Lazy initialization of the numba batcher."""
+        if not self._batcher_initialized:
+            self._batcher = prewarm_numba_functions(
+                self.premetric_weight_function,
+                feature_dim=len(self.feature_cols or
+                              self.node_df.select_dtypes(include='number').columns)
+            )
+            self._batcher_initialized = True
+        return self._batcher
 
     def _suggest_euclidean_optimization(self, graph_distances, euclidean_distances, threshold=0.01):
         """
@@ -442,7 +701,8 @@ class DataGraphGenerator:
     def extract_mst_edges_boruvka(self, graph, n):
         """
         Extract MST edges via streaming Borůvka MST (avoids CSR->CSC conversion).
-        Returns a boolean mask array aligned with the graph's upper triangle edges.
+        Returns a boolean mask array aligned with the graph's upper triangle edges,
+        plus the row/col arrays for reference.
         """
         self.timing.start("extract_mst_edges")
     
@@ -627,6 +887,10 @@ class DataGraphGenerator:
         n_edges = len(edge_arr)
         print(f"Tracking {n_edges} unique edges from CSR")
         
+        # Cache the edge array
+        graph_id = id(G_knn)
+        self._edge_arr_cache[graph_id] = edge_arr
+        
         # Pre‐allocate all trackers at once
         dtype = np.float32 if self.use_float32 else np.float64
         graph_distances          = np.zeros(n_edges, dtype=dtype)
@@ -635,9 +899,14 @@ class DataGraphGenerator:
         is_valid_edge            = np.ones(n_edges, dtype=bool)
         
         self.timing.end("create_knn_graph_with_mst.initialize_edge_tracking")
-        # Initialize batch statistics trackers
-        graph_distance_stats = BatchStats()
-        euclidean_stats = BatchStats()
+        
+        # Initialize statistics accumulators
+        sum_graph_x = 0.0
+        sum_graph_x2 = 0.0
+        count_graph = 0
+        sum_euclidean_x = 0.0
+        sum_euclidean_x2 = 0.0
+        count_euclidean = 0
         
         # NEW: If using Euclidean optimization, skip graph distance computation
         if self.use_euclidean_as_graph_distance:
@@ -651,12 +920,20 @@ class DataGraphGenerator:
             # Update statistics
             valid_mask = euclidean_distances_list > 0
             if np.sum(valid_mask) > 0:
-                graph_distance_stats.update_batch(euclidean_distances_list[valid_mask])
-                euclidean_stats.update_batch(euclidean_distances_list[valid_mask])
+                valid_dists = euclidean_distances_list[valid_mask]
+                sum_graph_x = np.sum(valid_dists)
+                sum_graph_x2 = np.sum(valid_dists ** 2)
+                count_graph = len(valid_dists)
+                sum_euclidean_x = sum_graph_x
+                sum_euclidean_x2 = sum_graph_x2
+                count_euclidean = count_graph
             
             scale_factor = 1.0  # No scaling needed
             
         else:
+            # Get the batcher lazily
+            batcher = self._get_batcher()
+            
             # Original iterative computation logic
             for iteration in range(max_iterations):
                 self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}")
@@ -704,21 +981,18 @@ class DataGraphGenerator:
                     batch_indices = new_edge_indices[batch_idx:end_idx]
                     
                     # Compute distances for this batch
-                    batch_distances = self._batcher(
+                    batch_distances = batcher(
                         self.node_features, batch_i, batch_j
                     )
                     
-                    # NEW: Check for missing values and mark invalid edges
-                    mask_missing = (batch_distances == self.missing_weight)
-                    missing_idx = batch_indices[mask_missing]
-                    valid_idx   = batch_indices[~mask_missing]
-                    
-                    # mark missing
-                    is_valid_edge[missing_idx]     = False
-                    graph_distances[missing_idx]   = np.inf
-                    
-                    # fill valid
-                    graph_distances[valid_idx]     = batch_distances[~mask_missing]
+                    # Vectorized missing value handling
+                    graph_distances[batch_indices] = np.where(
+                        batch_distances == self.missing_weight,
+                        np.inf,
+                        batch_distances
+                    )
+                    is_valid_edge[batch_indices] = batch_distances != self.missing_weight
+                    removed_count += np.sum(batch_distances == self.missing_weight)
 
                     # Get the corresponding Euclidean distances for this batch
                     batch_euclidean = euclidean_distances_list[batch_indices]
@@ -728,30 +1002,40 @@ class DataGraphGenerator:
                     
                     # Find valid pairs for statistics (positive values and not missing)
                     valid_mask = (batch_distances > 0) & (batch_euclidean > 0) & (batch_distances != self.missing_weight)
-                    valid_graph = batch_distances[valid_mask]
-                    valid_euclidean = batch_euclidean[valid_mask]
-                    
-                    # Update batch statistics
-                    if len(valid_graph) > 0:
-                        graph_distance_stats.update_batch(valid_graph)
-                        euclidean_stats.update_batch(valid_euclidean)
+                    if np.sum(valid_mask) > 0:
+                        valid_graph = batch_distances[valid_mask]
+                        valid_euclidean = batch_euclidean[valid_mask]
+                        
+                        # Update running sums for statistics
+                        sum_graph_x += np.sum(valid_graph)
+                        sum_graph_x2 += np.sum(valid_graph ** 2)
+                        count_graph += len(valid_graph)
+                        
+                        sum_euclidean_x += np.sum(valid_euclidean)
+                        sum_euclidean_x2 += np.sum(valid_euclidean ** 2)
+                        count_euclidean += len(valid_euclidean)
                 
                 if removed_count > 0 and self.verbose:
                     print(f"         Removed {removed_count} edges with missing values")
                 
                 self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.compute_graph_distances")
         
-                # Calculate scaling factor between graph and Euclidean distances using batch statistics
-                if graph_distance_stats.count > 0:
-                    graph_distance_mean = graph_distance_stats.mean
-                    euclidean_mean = euclidean_stats.mean
+                # Calculate scaling factor between graph and Euclidean distances using running statistics
+                if count_graph > 0:
+                    graph_distance_mean = sum_graph_x / count_graph
+                    euclidean_mean = sum_euclidean_x / count_euclidean
                     scale_factor = euclidean_mean / graph_distance_mean if graph_distance_mean > 0 else 1.0
+                    
+                    # Calculate standard deviations
+                    graph_variance = (sum_graph_x2 / count_graph) - graph_distance_mean**2
+                    graph_std = np.sqrt(max(0, graph_variance))
                     
                     if self.verbose:
                         print(f"         Scale factor: {scale_factor:.4g} "
                               f"(graph mean: {graph_distance_mean:.4g}, Euclidean mean: {euclidean_mean:.4g})")
-                        print(f"         graph stats: min={graph_distance_stats.min_val:.4g}, max={graph_distance_stats.max_val:.4g}, "
-                              f"std={graph_distance_stats.get_std():.4g}, count={graph_distance_stats.count}")
+                        print(f"         graph stats: min={np.min(graph_distances[graph_distance_computed]):.4g}, "
+                              f"max={np.max(graph_distances[graph_distance_computed]):.4g}, "
+                              f"std={graph_std:.4g}, count={count_graph}")
                     
                     # Check if we should suggest Euclidean optimization
                     if iteration == 0:  # Only check on first iteration
@@ -879,6 +1163,37 @@ class DataGraphGenerator:
         filtered_euclidean_distances = euclidean_distances_list[valid_indices]
         filtered_is_mst_edge = is_mst_edge[valid_indices]
         
+        # Compute final statistics if we have data
+        graph_distance_stats = None
+        euclidean_stats = None
+        
+        if count_graph > 0:
+            graph_mean = sum_graph_x / count_graph
+            graph_variance = (sum_graph_x2 / count_graph) - graph_mean**2
+            graph_std = np.sqrt(max(0, graph_variance))
+            
+            valid_graph_dists = graph_distances[graph_distance_computed & is_valid_edge]
+            graph_distance_stats = {
+                'mean': graph_mean,
+                'std': graph_std,
+                'min': np.min(valid_graph_dists) if len(valid_graph_dists) > 0 else 0,
+                'max': np.max(valid_graph_dists) if len(valid_graph_dists) > 0 else 0,
+                'count': count_graph
+            }
+            
+        if count_euclidean > 0:
+            euclidean_mean = sum_euclidean_x / count_euclidean
+            euclidean_variance = (sum_euclidean_x2 / count_euclidean) - euclidean_mean**2
+            euclidean_std = np.sqrt(max(0, euclidean_variance))
+            
+            euclidean_stats = {
+                'mean': euclidean_mean,
+                'std': euclidean_std,
+                'min': np.min(filtered_euclidean_distances) if len(filtered_euclidean_distances) > 0 else 0,
+                'max': np.max(filtered_euclidean_distances) if len(filtered_euclidean_distances) > 0 else 0,
+                'count': count_euclidean
+            }
+        
         return final_graph, {
             'edge_arr': filtered_edge_arr,  # Now returning array instead of list
             'graph_distances': filtered_graph_distances,
@@ -886,8 +1201,8 @@ class DataGraphGenerator:
             'is_mst_edge': filtered_is_mst_edge,
             'graph_distance_scalar': scale_factor,
             # Add statistics to the returned data
-            'graph_distance_stats': graph_distance_stats.get_stats() if graph_distance_stats.count > 0 else None,
-            'euclidean_stats': euclidean_stats.get_stats() if euclidean_stats.count > 0 else None,
+            'graph_distance_stats': graph_distance_stats,
+            'euclidean_stats': euclidean_stats,
             'n_removed_edges': len(edge_arr) - len(filtered_edge_arr),  # Track removed edges
             'use_euclidean_as_graph_distance': self.use_euclidean_as_graph_distance,
             'mst_computed': force_mst
@@ -1041,12 +1356,28 @@ class DataGraphGenerator:
                 
         self.timing.end("prune_graph_by_threshold.prepare_mst")
         
-        # Sort edges by distance (in descending order)
-        self.timing.start("prune_graph_by_threshold.sort_edges")
-        sorted_indices = np.argsort(graph_distances)[::-1]
-        sorted_edges = edge_arr[sorted_indices]  # Direct array indexing
-        sorted_distances = graph_distances[sorted_indices]
-        self.timing.end("prune_graph_by_threshold.sort_edges")
+        # Check if we have cached sorted edges
+        graph_id = id(graph)
+        cache_key = (graph_id, 'sorted')
+        
+        if cache_key in self._sorted_edge_cache:
+            sorted_indices = self._sorted_edge_cache[cache_key]['indices']
+            sorted_edges = self._sorted_edge_cache[cache_key]['edges']
+            sorted_distances = self._sorted_edge_cache[cache_key]['distances']
+        else:
+            # Sort edges by distance (in descending order)
+            self.timing.start("prune_graph_by_threshold.sort_edges")
+            sorted_indices = np.argsort(graph_distances)[::-1]
+            sorted_edges = edge_arr[sorted_indices]  # Direct array indexing
+            sorted_distances = graph_distances[sorted_indices]
+            
+            # Cache the sorted data
+            self._sorted_edge_cache[cache_key] = {
+                'indices': sorted_indices,
+                'edges': sorted_edges,
+                'distances': sorted_distances
+            }
+            self.timing.end("prune_graph_by_threshold.sort_edges")
         
         if self.verbose:
             # Use precomputed statistics if available
@@ -1175,17 +1506,18 @@ class DataGraphGenerator:
                     current_components = n_components
             self.timing.end("prune_graph_by_threshold.check_components")
         
-        # Apply pruning using in-place edge removal (B.6 optimization)
+        # Apply pruning using optimized in-place modification
         self.timing.start("prune_graph_by_threshold.apply_pruning")
-        pruned_graph = graph.copy()
         
-        # Remove edges in-place
-        for edge in edges_to_prune:
-            pruned_graph[edge[0], edge[1]] = 0
-            pruned_graph[edge[1], edge[0]] = 0
+        # Create a mask for edges to keep
+        edges_to_remove_set = set(map(tuple, edges_to_prune))
+        keep_mask = np.array([tuple(edge) not in edges_to_remove_set for edge in edge_arr])
         
-        # Ensure the matrix is still in CSR format and eliminate zeros
-        pruned_graph.eliminate_zeros()
+        # Build pruned graph directly with the keep mask
+        pruned_graph = self.build_graph_from_edges_memory_efficient(
+            edge_arr, graph_distances, keep_mask, n
+        )
+        
         self.timing.end("prune_graph_by_threshold.apply_pruning")
         
         # Create new edge data for the pruned graph more efficiently
@@ -1209,12 +1541,16 @@ class DataGraphGenerator:
         else:
             pruned_is_mst_edge = None
         
-        # Create a new BatchStats object to recalculate statistics for the pruned graph
-        if 'graph_distance_stats' in edge_data and edge_data['graph_distance_stats'] is not None:
-            pruned_graph_distance_stats = BatchStats()
-            pruned_graph_distance_stats.update_batch(pruned_weights)
-        else:
-            pruned_graph_distance_stats = None
+        # Create updated statistics for the pruned graph
+        pruned_graph_distance_stats = None
+        if len(pruned_weights) > 0:
+            pruned_graph_distance_stats = {
+                'mean': np.mean(pruned_weights),
+                'std': np.std(pruned_weights),
+                'min': np.min(pruned_weights),
+                'max': np.max(pruned_weights),
+                'count': len(pruned_weights)
+            }
         
         pruned_edge_data = {
             'edge_arr': pruned_edge_arr,  # Now storing as array
@@ -1227,7 +1563,7 @@ class DataGraphGenerator:
         
         # Add statistics if we calculated them
         if pruned_graph_distance_stats is not None:
-            pruned_edge_data['graph_distance_stats'] = pruned_graph_distance_stats.get_stats()
+            pruned_edge_data['graph_distance_stats'] = pruned_graph_distance_stats
         
         # Copy over other statistics if they were available
         if 'euclidean_stats' in edge_data:
@@ -1265,7 +1601,7 @@ class DataGraphGenerator:
             'threshold': threshold
         }
 
-    def smooth_graph_with_2hop(self, graph, edge_data, node_df, semimetric_weight_function, 
+    def smooth_graph_with_2hop(self, graph, edge_data, node_df, premetric_weight_function, 
                               max_new_edges=None, batch_size=None):
         """
         Smooth the graph by adding connections between 2-hop neighbors.
@@ -1307,23 +1643,30 @@ class DataGraphGenerator:
         # Create a set of existing edges for fast lookup
         existing_edges = set(map(tuple, edge_arr))
         
-        # Find 2-hop neighbors
+        # Find 2-hop neighbors using sparse matrix operations
         self.timing.start("smooth_graph_with_2hop.find_2hop")
-        new_edges = find_2hop_neighbors_efficient(graph, existing_edges)
+        new_edge_arr = find_2hop_neighbors_sparse(graph)
+        
+        # Filter out existing edges
+        new_edges_mask = np.array([
+            tuple(edge) not in existing_edges 
+            for edge in new_edge_arr
+        ])
+        new_edge_arr = new_edge_arr[new_edges_mask]
         self.timing.end("smooth_graph_with_2hop.find_2hop")
         
-        if max_new_edges is not None and len(new_edges) > max_new_edges:
+        if max_new_edges is not None and len(new_edge_arr) > max_new_edges:
             if self.verbose:
-                print(f"         Found {len(new_edges)} potential 2-hop connections, limiting to {max_new_edges}")
-            # Randomly sample a subset of new edges using indices
-            random_indices = np.random.choice(len(new_edges), max_new_edges, replace=False)
-            new_edges = [new_edges[i] for i in random_indices]
+                print(f"         Found {len(new_edge_arr)} potential 2-hop connections, limiting to {max_new_edges}")
+            # Randomly sample a subset of new edges
+            random_indices = np.random.choice(len(new_edge_arr), max_new_edges, replace=False)
+            new_edge_arr = new_edge_arr[random_indices]
         
         if self.verbose:
-            print(f"         Adding up to {len(new_edges)} new 2-hop connections")
+            print(f"         Adding up to {len(new_edge_arr)} new 2-hop connections")
         
         # If no new edges, return early
-        if len(new_edges) == 0:
+        if len(new_edge_arr) == 0:
             if self.verbose:
                 print(f"         No new 2-hop connections to add")
             
@@ -1334,13 +1677,11 @@ class DataGraphGenerator:
                 'new_distances': np.array([])
             }
         
-        # Convert new edges to array format for efficient processing
-        new_edge_arr = np.array(new_edges, dtype=np.int32)
         new_i = new_edge_arr[:, 0]
         new_j = new_edge_arr[:, 1]
         
         # Compute graph distances for new edges in batches
-        valid_new_edge_list = []  # Will convert to array later
+        valid_new_edges = []
         new_edge_distances = []
         
         # If using Euclidean optimization, compute embeddings once
@@ -1358,30 +1699,33 @@ class DataGraphGenerator:
             # Estimate based on dataframe size
             batch_size = min(100000, n_items)
                     
-        n_batches = (len(new_edges) - 1) // batch_size + 1
-        if self.verbose and len(new_edges) > batch_size:
+        n_batches = (len(new_edge_arr) - 1) // batch_size + 1
+        if self.verbose and len(new_edge_arr) > batch_size:
             print(f"         Processing in {n_batches} batches of size {batch_size}")
         
         removed_count = 0  # Track edges with missing values
         
-        for batch_idx in range(0, len(new_edges), batch_size):
-            if self.verbose and len(new_edges) > batch_size and batch_idx % (10 * batch_size) == 0:
+        # Get the batcher lazily
+        batcher = self._get_batcher() if not use_euclidean else None
+        
+        for batch_idx in range(0, len(new_edge_arr), batch_size):
+            if self.verbose and len(new_edge_arr) > batch_size and batch_idx % (10 * batch_size) == 0:
                 print(f"         Processing batch {batch_idx//batch_size + 1}/{n_batches}")
                 
-            end_idx = min(batch_idx + batch_size, len(new_edges))
+            end_idx = min(batch_idx + batch_size, len(new_edge_arr))
             batch_i = new_i[batch_idx:end_idx]
             batch_j = new_j[batch_idx:end_idx]
             batch_edges = new_edge_arr[batch_idx:end_idx]
             
             if use_euclidean:
-                # Compute Euclidean distances directly
-                batch_distances = np.array([
-                    np.linalg.norm(embeddings[i] - embeddings[j])
-                    for i, j in zip(batch_i, batch_j)
-                ])
+                # Compute Euclidean distances directly (vectorized)
+                batch_distances = np.linalg.norm(
+                    embeddings[batch_i] - embeddings[batch_j], 
+                    axis=1
+                )
             else:
                 # Compute distances for this batch using the custom function
-                batch_distances = self._batcher(
+                batch_distances = batcher(
                     self.node_features, batch_i, batch_j
                 )
             
@@ -1393,15 +1737,15 @@ class DataGraphGenerator:
             removed_count += np.sum(~valid_mask)
             
             # Add valid edges to results
-            for edge, dist in zip(valid_batch_edges, valid_batch_distances):
-                valid_new_edge_list.append(edge)
-                new_edge_distances.append(dist)
+            if len(valid_batch_edges) > 0:
+                valid_new_edges.extend(valid_batch_edges)
+                new_edge_distances.extend(valid_batch_distances)
                     
         self.timing.end("smooth_graph_with_2hop.compute_distances")
         
         # Convert to arrays
-        if len(valid_new_edge_list) > 0:
-            valid_new_edges = np.array(valid_new_edge_list, dtype=np.int32)
+        if len(valid_new_edges) > 0:
+            valid_new_edges = np.array(valid_new_edges, dtype=np.int32)
             new_edge_distances = np.array(new_edge_distances)
         else:
             valid_new_edges = np.array([], dtype=np.int32).reshape(0, 2)
@@ -1427,15 +1771,14 @@ class DataGraphGenerator:
         # Add new edges to the graph more efficiently
         self.timing.start("smooth_graph_with_2hop.add_edges")
 
-        # Modify the original graph in place by adding new edges
-        smoothed_graph = graph.copy()  # Still need one copy
+        # Build a new graph with all edges combined
+        all_edges = np.vstack([edge_arr, valid_new_edges])
+        all_distances = np.concatenate([graph_distances, new_edge_distances])
         
-        # Add new edges directly to the smoothed graph
-        for idx in range(len(valid_new_edges)):
-            i, j = valid_new_edges[idx]
-            dist = new_edge_distances[idx]
-            smoothed_graph[i, j] = dist
-            smoothed_graph[j, i] = dist  # Keep the graph symmetric
+        smoothed_graph = self.build_graph_from_edges_memory_efficient(
+            all_edges, all_distances, np.ones(len(all_edges), dtype=bool), n
+        )
+        
         self.timing.end("smooth_graph_with_2hop.add_edges")
 
         # Update edge data
@@ -1522,7 +1865,7 @@ class DataGraphGenerator:
                        graph,
                        edge_data,
                        node_df,
-                       semimetric_weight_function,
+                       premetric_weight_function,
                        n_iterations=2,
                        threshold=None,
                        kneedle_sensitivity=1.0,
@@ -1576,7 +1919,7 @@ class DataGraphGenerator:
                 # 1a) Smooth (if enabled)
                 if do_smoothing:
                     sm_graph, sm_edge_data, sm_res = self.smooth_graph_with_2hop(
-                        current_graph, current_edge_data, node_df, semimetric_weight_function,
+                        current_graph, current_edge_data, node_df, premetric_weight_function,
                         max_new_edges=max_new_edges, batch_size=batch_size
                     )
                 else:
@@ -1610,7 +1953,7 @@ class DataGraphGenerator:
                 # 2b) Smooth (if enabled)
                 if do_smoothing:
                     sm_graph, sm_edge_data, sm_res = self.smooth_graph_with_2hop(
-                        pr_graph, pr_edge_data, node_df, semimetric_weight_function,
+                        pr_graph, pr_edge_data, node_df, premetric_weight_function,
                         max_new_edges=max_new_edges, batch_size=batch_size
                     )
                 else:
@@ -1672,7 +2015,7 @@ class DataGraphGenerator:
         -----------
         node_df : pandas.DataFrame
             DataFrame containing node information
-        semimetric_weight_function : callable
+        premetric_weight_function : callable
             Function that computes distance between two DataFrame rows
         embedding_function : callable
             Function that takes a DataFrame row and returns embedding coordinates
@@ -1688,7 +2031,7 @@ class DataGraphGenerator:
         self.timing.start("build_and_refine_graph")
 
         node_df = self.node_df
-        semimetric_weight_function = self.semimetric_weight_function
+        premetric_weight_function = self.premetric_weight_function
         feature_cols=self.feature_cols
         embedding_function = self.embedding_function
         
@@ -1711,7 +2054,8 @@ class DataGraphGenerator:
             n_neighbors=n_neighbors,
             max_iterations=mst_iterations,
             batch_size=batch_size,
-            use_approximate_nn=use_approximate_nn
+            use_approximate_nn=use_approximate_nn,
+            force_mst=preserve_mst  # Only compute MST if we're going to preserve it
         )
         self.timing.end("step1_knn_mst")
         step1_time = time.time()-t1
@@ -1726,7 +2070,7 @@ class DataGraphGenerator:
         t2 = time.time()
         self.timing.start("step2_refinement")
         final_graph, final_edge_data, history = self.iterative_refine_graph(
-            mst_graph, edge_data, node_df, semimetric_weight_function,
+            mst_graph, edge_data, node_df, premetric_weight_function,
             n_iterations=polish_iterations,
             threshold=prune_threshold,
             kneedle_sensitivity=kneedle_sensitivity,
@@ -1765,7 +2109,7 @@ class DataGraphGenerator:
             final_graph, 
             node_df=node_df,
             feature_cols=feature_cols,
-            semimetric_weight_function=semimetric_weight_function,
+            premetric_weight_function=premetric_weight_function,
             embedding_function=embedding_function,
             edge_data=final_edge_data, 
             component_labels=component_labels,
@@ -1832,6 +2176,10 @@ class DataGraphGenerator:
                 pct = graph_build_time / total_time * 100
                 print(f"  • Graph construction operations: {graph_build_time:.2f}s ({pct:.1f}% of total)")
         
+        # Clear caches to free memory
+        self._edge_arr_cache.clear()
+        self._sorted_edge_cache.clear()
+        
         # Return graph object and additional results
         return graph_obj, {
             "initial_mst": mst_graph,
@@ -1847,6 +2195,6 @@ class DataGraphGenerator:
                 "step1_knn_mst": step1_time,
                 "step2_refinement": step2_time, 
                 "step3_analysis": step3_time,
-                "graph_distance_distance_calculation": graph_distance_compute_time if 'graph_distance_compute_time' in locals() else 0
+                "graph_distance_calculation": graph_distance_compute_time if 'graph_distance_compute_time' in locals() else 0
             }
         }
