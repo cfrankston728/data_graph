@@ -18,7 +18,7 @@ class DataGraph:
     def __init__(self, graph_matrix=None, 
                  node_df=None,
                  feature_cols=None,
-                 semimetric_weight_function=None, 
+                 premetric_weight_function=None, 
                  embedding_function=None, 
                  edge_data=None, 
                  component_labels=None,
@@ -35,7 +35,7 @@ class DataGraph:
             DataFrame containing node attributes. If None, an empty DataFrame is created.
         feature_cols : list or None, optional
             List of column names to use as features. If None, all numeric columns are used.
-        semimetric_weight_function : callable, optional
+        premetric_weight_function : callable, optional
             Function to compute weights between nodes. If None, a default Euclidean distance is used.
         embedding_function : callable, optional
             Function to compute embeddings. If None, a default identity function is used.
@@ -49,10 +49,10 @@ class DataGraph:
             Weight for missing connections
         """
         # Set default weight function if not provided
-        if semimetric_weight_function is None:
-            self.semimetric_weight_function = self._default_weight_function
+        if premetric_weight_function is None:
+            self.premetric_weight_function = self._default_weight_function
         else:
-            self.semimetric_weight_function = semimetric_weight_function
+            self.premetric_weight_function = premetric_weight_function
         
         # Set default embedding function if not provided
         if embedding_function is None:
@@ -129,7 +129,7 @@ class DataGraph:
         self.node_features = arr
         
     def compute_graph_distance(self, i, j):
-        return self.semimetric_weight_function(self.node_features, i, j)
+        return self.premetric_weight_function(self.node_features, i, j)
         
     def compute_components(self):
         """Compute connected components of the graph"""
@@ -315,7 +315,7 @@ class DataGraph:
             embedding_params: Optional dictionary of embedding parameters
             compress: Whether to use compression for large arrays
             function_references: Dict with function references as 
-                               {'semimetric_weight_function': 'module.submodule:function_name', 
+                               {'premetric_weight_function': 'module.submodule:function_name', 
                                 'embedding_function': 'module.submodule:function_name'}
                                If None, functions will be pickled (less portable but simpler)
         """
@@ -359,11 +359,11 @@ class DataGraph:
             print("Saving weight and embedding functions (pickled)...")
             with open(f"{output_dir}/functions.pkl", 'wb') as f:
                 # Check if we're using default functions
-                using_default_weight = self.semimetric_weight_function == self._default_weight_function
+                using_default_weight = self.premetric_weight_function == self._default_weight_function
                 using_default_embedding = self.embedding_function == self._default_embedding_function
                 
                 pickle.dump({
-                    'semimetric_weight_function': self.semimetric_weight_function,
+                    'premetric_weight_function': self.premetric_weight_function,
                     'embedding_function': self.embedding_function,
                     'using_default_weight': using_default_weight,
                     'using_default_embedding': using_default_embedding
@@ -445,7 +445,7 @@ class DataGraph:
                 function_refs = json.load(f)
                 
             # Import the functions based on references
-            semimetric_weight_function = cls._import_function(function_refs['semimetric_weight_function'])
+            premetric_weight_function = cls._import_function(function_refs['premetric_weight_function'])
             embedding_function = cls._import_function(function_refs['embedding_function'])
         else:
             print("Loading weight and embedding functions (pickled)...")
@@ -455,9 +455,9 @@ class DataGraph:
                     
                 # Check if we stored info about default functions
                 if 'using_default_weight' in functions and functions['using_default_weight']:
-                    semimetric_weight_function = cls._default_weight_function
+                    premetric_weight_function = cls._default_weight_function
                 else:
-                    semimetric_weight_function = functions['semimetric_weight_function']
+                    premetric_weight_function = functions['premetric_weight_function']
                     
                 if 'using_default_embedding' in functions and functions['using_default_embedding']:
                     embedding_function = cls._default_embedding_function
@@ -466,7 +466,7 @@ class DataGraph:
             except Exception as e:
                 print(f"Warning: Could not load functions properly: {e}")
                 print("Using default functions instead")
-                semimetric_weight_function = cls._default_weight_function
+                premetric_weight_function = cls._default_weight_function
                 embedding_function = cls._default_embedding_function
         
         # 7. Parse special values
@@ -482,7 +482,7 @@ class DataGraph:
             graph_matrix=adjacency,
             node_df=node_df,
             feature_cols=metadata["feature_cols"],
-            semimetric_weight_function=semimetric_weight_function,
+            premetric_weight_function=premetric_weight_function,
             embedding_function=embedding_function,
             edge_data=edge_data,
             component_labels=component_labels,
@@ -557,7 +557,7 @@ class DataGraph:
                 function_refs = json.load(f)
                 
             # Import the functions based on references
-            self.semimetric_weight_function = self._import_function(function_refs['semimetric_weight_function'])
+            self.premetric_weight_function = self._import_function(function_refs['premetric_weight_function'])
             self.embedding_function = self._import_function(function_refs['embedding_function'])
         else:
             print("Loading weight and embedding functions (pickled)...")
@@ -567,9 +567,9 @@ class DataGraph:
                     
                 # Check if we stored info about default functions
                 if 'using_default_weight' in functions and functions['using_default_weight']:
-                    self.semimetric_weight_function = self._default_weight_function
+                    self.premetric_weight_function = self._default_weight_function
                 else:
-                    self.semimetric_weight_function = functions['semimetric_weight_function']
+                    self.premetric_weight_function = functions['premetric_weight_function']
                     
                 if 'using_default_embedding' in functions and functions['using_default_embedding']:
                     self.embedding_function = self._default_embedding_function
@@ -578,7 +578,7 @@ class DataGraph:
             except Exception as e:
                 print(f"Warning: Could not load functions properly: {e}")
                 print("Using default functions instead")
-                self.semimetric_weight_function = self._default_weight_function
+                self.premetric_weight_function = self._default_weight_function
                 self.embedding_function = self._default_embedding_function
         
         # 7. Parse special values

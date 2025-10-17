@@ -2,53 +2,28 @@
 DataGraphVisualizer - Visualization tools for DataGraph objects.
 """
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.collections import LineCollection
+
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
+
+from umap import UMAP
+from umap.umap_ import (
+    fuzzy_simplicial_set,
+    simplicial_set_embedding,
+    find_ab_params
+)
+
 from .core_utilities import TimingStats
 
-# --- Lazy loaders for heavy/optional deps -------------------------------------
-import contextlib
-import importlib
-import builtins
-
-@contextlib.contextmanager
-def _block_tensorflow_import():
-    """Temporarily raise ImportError for any tensorflow* import.
-
-    This lets `umap` import without pulling in its parametric (TF) module.
-    """
-    real_import = builtins.__import__
-    def _hook(name, *a, **kw):
-        if name.startswith("tensorflow"):
-            raise ImportError("TF intentionally blocked during UMAP import")
-        return real_import(name, *a, **kw)
-    builtins.__import__ = _hook
-    try:
-        yield
-    finally:
-        builtins.__import__ = real_import
-
-def _load_umap_primitives():
-    """Import UMAP primitives without initializing TensorFlow."""
-    with _block_tensorflow_import():
-        umap_umap = importlib.import_module("umap.umap_")
-    # Return what we need (no top-level `import umap`)
-    return (
-        umap_umap.UMAP,
-        umap_umap.fuzzy_simplicial_set,
-        umap_umap.simplicial_set_embedding,
-        umap_umap.find_ab_params,
-    )
-
-def _load_matplotlib():
-    import matplotlib.pyplot as plt
-    from matplotlib.collections import LineCollection
-    return plt, LineCollection
-
-def _load_plotly():
-    import plotly.graph_objs as go
-    return go
-
+# Import plotly for interactive 3D visualizations
+import plotly.graph_objs as go
+import plotly.express as px
+import plotly.figure_factory as ff
+from plotly.subplots import make_subplots
+import plotly.colors
 
 
 class DataGraphVisualizer:
@@ -210,9 +185,6 @@ class DataGraphVisualizer:
             Information about the embedding process including dummy nodes if added
         """
         self.timing.start("create_umap_embedding")
-        if self.verbose:
-            print(f"[UMAP] Loading umap primitives...")
-        UMAP, fuzzy_simplicial_set, simplicial_set_embedding, find_ab_params = _load_umap_primitives()
         
         if self.verbose:
             print(f"[UMAP] Creating {n_components}D UMAP embedding")
@@ -491,7 +463,6 @@ class DataGraphVisualizer:
             The axes object
         """
         self.timing.start("plot_embedding")
-        plt, LineCollection = _load_matplotlib()
         
         # Validate embedding dimensions
         if embedding.shape[1] != 2:
@@ -740,7 +711,6 @@ class DataGraphVisualizer:
             The interactive figure object
         """
         self.timing.start("plot_3d_embedding")
-        go = _load_plotly()
         
         # Validate embedding dimensions
         if embedding.shape[1] != 3:
@@ -1799,7 +1769,6 @@ class DataGraphVisualizer:
         plotly.graph_objs.Figure
             The interactive figure object
         """
-        go = _load_plotly()
         print(f"Original embedding shape: {embedding.shape}")
         
         # Sample data if needed
