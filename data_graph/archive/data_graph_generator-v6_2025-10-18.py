@@ -764,6 +764,7 @@ class DataGraphGenerator:
             print(f"         Computed embeddings with shape: {embeddings.shape}")
 
         self.timing.end("create_knn_graph_with_mst.compute_embeddings")
+
         
         # Step 2: Find nearest neighbors in embedding space (FAISS IVF-Flat on reduced + optional row-wise reweight)
         self.timing.start("create_knn_graph_with_mst.find_nearest_neighbors")
@@ -778,24 +779,24 @@ class DataGraphGenerator:
         X_knn = np.ascontiguousarray(X_knn.astype(np.float32, copy=False))
         n, d = X_knn.shape
 
-        # Config knobs
-        backend     = getattr(self, "knn_backend", None)         # "faiss_ivf_cpu" / "faiss_ivf_gpu" / "faiss_flat_cpu" / "faiss_flat_gpu" / None
-        nlist       = getattr(self, "faiss_nlist", None)
-        nprobe      = getattr(self, "faiss_nprobe", 64)
-        train_sz    = getattr(self, "faiss_train_size", None)    # default computed below
-        seed        = getattr(self, "faiss_seed", 0)
-        q_batch     = getattr(self, "faiss_query_batch", 200_000)
+        # Config knobs (all optional; set as attributes on self if you want)
+        backend   = getattr(self, "knn_backend", None)         # "faiss_ivf_cpu" / "faiss_ivf_gpu" / "faiss_flat_cpu" / "faiss_flat_gpu"
+        nlist     = getattr(self, "faiss_nlist", None)
+        nprobe    = getattr(self, "faiss_nprobe", 64)
+        train_sz  = getattr(self, "faiss_train_size", None)    # default computed below
+        seed      = getattr(self, "faiss_seed", 0)
+        q_batch   = getattr(self, "faiss_query_batch", 200_000)
         weights_from = getattr(self, "knn_weights_from", "original")  # "original" | "reduced"
 
-        # Reasonable defaults
+        # Reasonable defaults if not provided
         if nlist is None:
-            # ~4*sqrt(n), rounded to a power of two
+            # ~4 * sqrt(n) rounded to next power-of-two-ish
             nlist = int(max(1024, 4 * np.sqrt(n)))
+            # round to nearest power of two for better IVF bucketization
             nlist = 1 << int(np.round(np.log2(nlist)))
+        # Training size: ~40 * nlist or full n if smaller
         if train_sz is None:
-            # ≥ 40*nlist (FAISS guidance), capped by n
             train_sz = int(min(n, max(40 * nlist, 256_000)))
-        nprobe = int(min(max(1, nprobe), nlist))
 
         use_gpu = False
         try:
@@ -806,18 +807,21 @@ class DataGraphGenerator:
                 except Exception:
                     pass
 
+            # Pick index type: IVF-Flat by default; allow exact flat if requested
             want_exact = backend in ("faiss_flat_cpu", "faiss_flat_gpu")
-            want_gpu   = backend in ("faiss_ivf_gpu", "faiss_flat_gpu") or (backend is None)  # default: try GPU
+            want_gpu   = backend in ("faiss_ivf_gpu", "faiss_flat_gpu") or (backend is None)  # default: try GPU for IVF
 
             if want_exact:
+                # Exact Flat L2 (no training)
                 cpu_index = faiss.IndexFlatL2(d)
                 route = "FAISS Exact Flat"
             else:
+                # IVF-Flat with k-means trained coarse quantizer
                 quantizer = faiss.IndexFlatL2(d)
                 cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
                 route = f"FAISS IVF-Flat (nlist={nlist}, nprobe={nprobe})"
 
-                # Train IVF on a large sample
+                # Train on a larger sample (≈ 40×nlist)
                 rng = np.random.RandomState(seed)
                 if train_sz >= n:
                     train_x = X_knn
@@ -826,14 +830,9 @@ class DataGraphGenerator:
                     idx = rng.choice(n, size=train_sz, replace=False).astype(np.int64)
                     train_x = X_knn[idx]
                     train_used = train_sz
-
                 if self.verbose:
-                    print(f"         [FAISS] training IVF on {train_used:,} vectors for {nlist} lists (~{train_used/nlist:.1f} per list)")
-                t0 = time.time()
+                    print(f"         [FAISS] training IVF on {train_used:,} vectors for {nlist} lists (≈{train_used/nlist:.1f} per list)")
                 cpu_index.train(train_x)
-                t1 = time.time()
-                if self.verbose:
-                    print(f"         [FAISS] train time: {t1 - t0:.2f}s")
 
             # Optionally move to GPU
             if want_gpu:
@@ -848,87 +847,110 @@ class DataGraphGenerator:
 
             # Add vectors & search params
             index.add(X_knn)
-            if hasattr(index, "nprobe"):
+            if hasattr(index, "nprobe"):  # IVF has nprobe; Flat doesn't
                 index.nprobe = nprobe
 
             print(f"         [NN-route] topology: reduced {d}D via {route} on {'GPU' if use_gpu else 'CPU'}; weights from: {weights_from}")
 
             # Search in batches; request k+1 to drop self
             k_eff = n_neighbors + 1
-
             rows_all, cols_all = [], []
             if weights_from == "reduced":
                 dists_all = []
 
             for start in range(0, n, q_batch):
                 end = min(start + q_batch, n)
-                D, I = index.search(X_knn[start:end], k_eff)  # D: float32 (squared L2), I: int64
+                D, I = index.search(X_knn[start:end], k_eff)  # D: float32 (squared L2 for Flat/IVF), I: int64
 
-                # Vectorized: drop -1 and self, then take first n_neighbors per row
-                # shape: (m, k_eff)
-                m = end - start
-                if m == 0:
-                    continue
-
-                # mask valid neighbors
-                row_ids = np.arange(start, end, dtype=np.int64)[:, None]
-                valid = (I >= 0) & (I != row_ids)
-
-                # keep the first n_neighbors True entries per row (results are sorted by distance)
-                csum = np.cumsum(valid, axis=1)
-                sel = valid & (csum <= n_neighbors)
-
-                # materialize rows/cols/data for selected neighbors
-                # rows: repeat each query index by its selected count
-                sel_counts = sel.sum(axis=1).astype(np.int32, copy=False)
-                if sel_counts.sum() == 0:
-                    continue
-
-                rr = np.repeat(np.arange(start, end, dtype=np.int32), sel_counts)
-                cc = I[sel].astype(np.int32, copy=False)
-
-                rows_all.append(rr)
-                cols_all.append(cc)
-
+                rr_list, cc_list = [], []
                 if weights_from == "reduced":
-                    dd = np.sqrt(D[sel].astype(np.float32, copy=False))
-                    dists_all.append(dd)
+                    dd_list = []
+
+                for r in range(end - start):
+                    qi = start + r
+                    row_idx = I[r]
+                    row_dst = D[r]
+
+                    # Filter out invalids and the query itself
+                    keep = (row_idx >= 0) & (row_idx != qi)
+                    if np.any(keep):
+                        nbr_idx = row_idx[keep][:n_neighbors].astype(np.int32, copy=False)
+                    else:
+                        nbr_idx = np.empty(0, dtype=np.int32)
+
+                    if nbr_idx.size == 0:
+                        continue
+
+                    rr_list.append(np.full(nbr_idx.size, qi, dtype=np.int32))
+                    cc_list.append(nbr_idx)
+
+                    if weights_from == "reduced":
+                        # convert squared L2 -> L2 to match sklearn 'distance' semantics
+                        dd = np.sqrt(row_dst[keep][:n_neighbors]).astype(np.float32, copy=False)
+                        dd_list.append(dd)
+
+                if cc_list:
+                    rows_all.append(np.concatenate(rr_list, axis=0))
+                    cols_all.append(np.concatenate(cc_list, axis=0))
+                    if weights_from == "reduced":
+                        dists_all.append(np.concatenate(dd_list, axis=0))
 
             if cols_all:
-                rows = np.concatenate(rows_all, axis=0)
-                cols = np.concatenate(cols_all,  axis=0)
+                rows = np.concatenate(rows_all)
+                cols = np.concatenate(cols_all)
                 if weights_from == "reduced":
-                    data = np.concatenate(dists_all, axis=0).astype(np.float32, copy=False)
+                    data = np.concatenate(dists_all).astype(np.float32, copy=False)
                 else:
+                    # placeholder ones; we’ll overwrite with row-wise weights below
                     data = np.ones_like(cols, dtype=np.float32)
                 A = csr_matrix((data, (rows, cols)), shape=(n, n))
             else:
+                # degenerate case; no edges
                 A = csr_matrix((n, n), dtype=np.float32)
 
+            # Row-wise reweight from chosen space (default: original) if needed
+            if weights_from != "reduced":
+                E_for_weights = embeddings if weights_from == "original" else X_knn
+                E_for_weights = np.ascontiguousarray(E_for_weights.astype(np.float32, copy=False))
+
+                self.timing.start("create_knn_graph_with_mst.rowwise_weights")
+                A = A.tocsr()
+                # allocate data buffer to be filled in-place
+                A.data = np.empty_like(A.indices, dtype=np.float32)
+                _fill_csr_with_rowwise_euclid(A.indptr, A.indices, E_for_weights, A.data)
+                self.timing.end("create_knn_graph_with_mst.rowwise_weights")
+
+            # Symmetrize, drop self loops, finalize
+            self.timing.start("create_knn_graph_with_mst.symmetrize")
+            G_knn = A.maximum(A.T)
+            G_knn.setdiag(0); G_knn.eliminate_zeros()
+            G_knn.sort_indices()
+            self.timing.end("create_knn_graph_with_mst.symmetrize")
+
         except Exception as e:
-            # Hard fallback: sklearn exact
+            # Hard fallback: sklearn (exact)
             if self.verbose:
                 print(f"         [FAISS] unavailable or failed ({e}). Falling back to sklearn.kneighbors_graph exact.")
-            from sklearn.neighbors import kneighbors_graph as _sk_kgraph
-            A = _sk_kgraph(X_knn, n_neighbors, mode=("distance" if weights_from == "reduced" else "connectivity"),
-                        include_self=False, n_jobs=self.n_jobs)
-
-        # Row-wise reweight from chosen space (default: original) if needed
-        if weights_from != "reduced":
-            E_for_weights = embeddings if weights_from == "original" else X_knn
-            E_for_weights = np.ascontiguousarray(E_for_weights.astype(np.float32, copy=False))
-            self.timing.start("create_knn_graph_with_mst.rowwise_weights")
-            A = A.tocsr()
-            A.data = np.empty_like(A.indices, dtype=np.float32)
-            _fill_csr_with_rowwise_euclid(A.indptr, A.indices, E_for_weights, A.data)
-            self.timing.end("create_knn_graph_with_mst.rowwise_weights")
-
-        # Symmetrize, drop diag, finalize
-        self.timing.start("create_knn_graph_with_mst.symmetrize")
-        G_knn = A.maximum(A.T)
-        G_knn.setdiag(0); G_knn.eliminate_zeros()
-        G_knn.sort_indices()
-        self.timing.end("create_knn_graph_with_mst.symmetrize")
+            from sklearn.neighbors import kneighbors_graph
+            A0 = kneighbors_graph(
+                X_knn, n_neighbors, mode=("distance" if weights_from == "reduced" else "connectivity"),
+                include_self=False, n_jobs=self.n_jobs
+            )
+            if weights_from == "reduced":
+                G_knn = A0.maximum(A0.T).astype(np.float32, copy=False)
+                G_knn.setdiag(0); G_knn.eliminate_zeros(); G_knn.sort_indices()
+            else:
+                A = A0
+                E_for_weights = embeddings if weights_from == "original" else X_knn
+                E_for_weights = np.ascontiguousarray(E_for_weights.astype(np.float32, copy=False))
+                self.timing.start("create_knn_graph_with_mst.rowwise_weights")
+                A = A.tocsr()
+                A.data = np.empty_like(A.indices, dtype=np.float32)
+                _fill_csr_with_rowwise_euclid(A.indptr, A.indices, E_for_weights, A.data)
+                self.timing.end("create_knn_graph_with_mst.rowwise_weights")
+                self.timing.start("create_knn_graph_with_mst.symmetrize")
+                G_knn = A.maximum(A.T); G_knn.setdiag(0); G_knn.eliminate_zeros(); G_knn.sort_indices()
+                self.timing.end("create_knn_graph_with_mst.symmetrize")
 
         # Connectivity check (unchanged)
         self.timing.start("create_knn_graph_with_mst.check_connectivity")
@@ -942,7 +964,6 @@ class DataGraphGenerator:
                 print(f"         KNN graph is connected")
             else:
                 print(f"         KNN graph has {n_components} connected components")
-        self.timing.end("create_knn_graph_with_mst.find_nearest_neighbors")
 
         
         # Initialize edge tracking

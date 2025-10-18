@@ -745,205 +745,136 @@ class DataGraphGenerator:
         
         # Step 1: Create embeddings using the embedding function
         self.timing.start("create_knn_graph_with_mst.compute_embeddings")
-
-        # Optional fast path: if you provide a vectorized function, use it.
-        # Set self.embedding_vectorizer to a callable that takes the full DataFrame
-        # and returns np.ndarray [n, d]. Otherwise we fall back to swifter.apply.
-        emb_vec = getattr(self, "embedding_vectorizer", None)
-        if callable(emb_vec):
-            embeddings = emb_vec(node_df)
-        else:
-            import swifter
-            swifter.set_defaults(progress_bar=False, verbose=True)
-            embeddings = np.array(node_df.swifter.apply(embedding_function, axis=1).tolist())
-
+        
+        # More efficient: use swifter.apply instead of iterrows
+        import swifter
+        swifter.set_defaults(progress_bar=False, verbose=True)
+        embeddings = np.array(node_df.swifter.apply(embedding_function, axis=1).tolist())
+        
         if self.use_float32:
-            embeddings = embeddings.astype(np.float32, copy=False)
-
+            embeddings = embeddings.astype(np.float32)
+            
         if self.verbose:
             print(f"         Computed embeddings with shape: {embeddings.shape}")
-
+        
         self.timing.end("create_knn_graph_with_mst.compute_embeddings")
         
-        # Step 2: Find nearest neighbors in embedding space (FAISS IVF-Flat on reduced + optional row-wise reweight)
+        # Step 2: Find nearest neighbors in embedding space
         self.timing.start("create_knn_graph_with_mst.find_nearest_neighbors")
-        print("Building CSR KNN graph (FAISS IVF-Flat on reduced + optional row-wise reweight)")
-
-        # Reduce only for neighbor selection (keeps downstream semantics identical)
-        X_knn, dr_info = reduce_for_knn(embeddings, self.knn_reduction, verbose=self.verbose)
-        if self.verbose and dr_info.get("method", "none") != "none":
-            print(f"         [KNN-DR] {dr_info}")
-
-        # Ensure fast, contiguous float32 for FAISS
-        X_knn = np.ascontiguousarray(X_knn.astype(np.float32, copy=False))
-        n, d = X_knn.shape
-
-        # Config knobs
-        backend     = getattr(self, "knn_backend", None)         # "faiss_ivf_cpu" / "faiss_ivf_gpu" / "faiss_flat_cpu" / "faiss_flat_gpu" / None
-        nlist       = getattr(self, "faiss_nlist", None)
-        nprobe      = getattr(self, "faiss_nprobe", 64)
-        train_sz    = getattr(self, "faiss_train_size", None)    # default computed below
-        seed        = getattr(self, "faiss_seed", 0)
-        q_batch     = getattr(self, "faiss_query_batch", 200_000)
-        weights_from = getattr(self, "knn_weights_from", "original")  # "original" | "reduced"
-
-        # Reasonable defaults
-        if nlist is None:
-            # ~4*sqrt(n), rounded to a power of two
-            nlist = int(max(1024, 4 * np.sqrt(n)))
-            nlist = 1 << int(np.round(np.log2(nlist)))
-        if train_sz is None:
-            # ≥ 40*nlist (FAISS guidance), capped by n
-            train_sz = int(min(n, max(40 * nlist, 256_000)))
-        nprobe = int(min(max(1, nprobe), nlist))
-
-        use_gpu = False
-        try:
-            import faiss
-            if self.n_jobs and self.n_jobs > 0:
-                try:
-                    faiss.omp_set_num_threads(self.n_jobs)
-                except Exception:
-                    pass
-
-            want_exact = backend in ("faiss_flat_cpu", "faiss_flat_gpu")
-            want_gpu   = backend in ("faiss_ivf_gpu", "faiss_flat_gpu") or (backend is None)  # default: try GPU
-
-            if want_exact:
-                cpu_index = faiss.IndexFlatL2(d)
-                route = "FAISS Exact Flat"
-            else:
-                quantizer = faiss.IndexFlatL2(d)
-                cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
-                route = f"FAISS IVF-Flat (nlist={nlist}, nprobe={nprobe})"
-
-                # Train IVF on a large sample
-                rng = np.random.RandomState(seed)
-                if train_sz >= n:
-                    train_x = X_knn
-                    train_used = n
-                else:
-                    idx = rng.choice(n, size=train_sz, replace=False).astype(np.int64)
-                    train_x = X_knn[idx]
-                    train_used = train_sz
-
-                if self.verbose:
-                    print(f"         [FAISS] training IVF on {train_used:,} vectors for {nlist} lists (~{train_used/nlist:.1f} per list)")
-                t0 = time.time()
-                cpu_index.train(train_x)
-                t1 = time.time()
-                if self.verbose:
-                    print(f"         [FAISS] train time: {t1 - t0:.2f}s")
-
-            # Optionally move to GPU
-            if want_gpu:
-                try:
-                    res = faiss.StandardGpuResources()
-                    index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-                    use_gpu = True
-                except Exception:
-                    index = cpu_index
-            else:
-                index = cpu_index
-
-            # Add vectors & search params
-            index.add(X_knn)
-            if hasattr(index, "nprobe"):
-                index.nprobe = nprobe
-
-            print(f"         [NN-route] topology: reduced {d}D via {route} on {'GPU' if use_gpu else 'CPU'}; weights from: {weights_from}")
-
-            # Search in batches; request k+1 to drop self
-            k_eff = n_neighbors + 1
-
-            rows_all, cols_all = [], []
-            if weights_from == "reduced":
-                dists_all = []
-
-            for start in range(0, n, q_batch):
-                end = min(start + q_batch, n)
-                D, I = index.search(X_knn[start:end], k_eff)  # D: float32 (squared L2), I: int64
-
-                # Vectorized: drop -1 and self, then take first n_neighbors per row
-                # shape: (m, k_eff)
-                m = end - start
-                if m == 0:
-                    continue
-
-                # mask valid neighbors
-                row_ids = np.arange(start, end, dtype=np.int64)[:, None]
-                valid = (I >= 0) & (I != row_ids)
-
-                # keep the first n_neighbors True entries per row (results are sorted by distance)
-                csum = np.cumsum(valid, axis=1)
-                sel = valid & (csum <= n_neighbors)
-
-                # materialize rows/cols/data for selected neighbors
-                # rows: repeat each query index by its selected count
-                sel_counts = sel.sum(axis=1).astype(np.int32, copy=False)
-                if sel_counts.sum() == 0:
-                    continue
-
-                rr = np.repeat(np.arange(start, end, dtype=np.int32), sel_counts)
-                cc = I[sel].astype(np.int32, copy=False)
-
-                rows_all.append(rr)
-                cols_all.append(cc)
-
-                if weights_from == "reduced":
-                    dd = np.sqrt(D[sel].astype(np.float32, copy=False))
-                    dists_all.append(dd)
-
-            if cols_all:
-                rows = np.concatenate(rows_all, axis=0)
-                cols = np.concatenate(cols_all,  axis=0)
-                if weights_from == "reduced":
-                    data = np.concatenate(dists_all, axis=0).astype(np.float32, copy=False)
-                else:
-                    data = np.ones_like(cols, dtype=np.float32)
-                A = csr_matrix((data, (rows, cols)), shape=(n, n))
-            else:
-                A = csr_matrix((n, n), dtype=np.float32)
-
-        except Exception as e:
-            # Hard fallback: sklearn exact
-            if self.verbose:
-                print(f"         [FAISS] unavailable or failed ({e}). Falling back to sklearn.kneighbors_graph exact.")
-            from sklearn.neighbors import kneighbors_graph as _sk_kgraph
-            A = _sk_kgraph(X_knn, n_neighbors, mode=("distance" if weights_from == "reduced" else "connectivity"),
-                        include_self=False, n_jobs=self.n_jobs)
-
-        # Row-wise reweight from chosen space (default: original) if needed
-        if weights_from != "reduced":
-            E_for_weights = embeddings if weights_from == "original" else X_knn
-            E_for_weights = np.ascontiguousarray(E_for_weights.astype(np.float32, copy=False))
-            self.timing.start("create_knn_graph_with_mst.rowwise_weights")
-            A = A.tocsr()
-            A.data = np.empty_like(A.indices, dtype=np.float32)
-            _fill_csr_with_rowwise_euclid(A.indptr, A.indices, E_for_weights, A.data)
-            self.timing.end("create_knn_graph_with_mst.rowwise_weights")
-
-        # Symmetrize, drop diag, finalize
-        self.timing.start("create_knn_graph_with_mst.symmetrize")
-        G_knn = A.maximum(A.T)
-        G_knn.setdiag(0); G_knn.eliminate_zeros()
-        G_knn.sort_indices()
-        self.timing.end("create_knn_graph_with_mst.symmetrize")
-
-        # Connectivity check (unchanged)
+        # Step 2: Directly build the CSR KNN graph
+        print("Building CSR KNN graph with kneighbors_graph...")
+        if use_approximate_nn:
+            print("Using approximate KNN (nmslib)")
+            import nmslib
+        
+            # 1) Initialize the index
+            n, d = embeddings.shape
+            idx = nmslib.init(method='hnsw', space='l2')
+            idx.addDataPointBatch(embeddings)
+            idx.createIndex({'post': 2}, print_progress=False)
+        
+            # 2) Query k neighbors for each point in batch
+            nbrs = idx.knnQueryBatch(
+                embeddings, 
+                k=n_neighbors, 
+                num_threads=self.n_jobs
+            )
+            # nbrs is a list of (labels, distances) tuples
+            labels, distances = zip(*nbrs)
+            labels    = np.vstack(labels).astype(np.int32)
+            distances = np.vstack(distances).astype(embeddings.dtype)
+        
+            # 3) Build symmetric CSR just like before
+            rows = np.repeat(np.arange(n, dtype=np.int32), n_neighbors)
+            cols = labels.ravel()
+            data = distances.ravel()
+            G0 = csr_matrix((data, (rows, cols)), shape=(n, n))
+            G_knn = G0.maximum(G0.T)
+            G_knn.sort_indices()
+        else:
+            G0 = kneighbors_graph(
+                embeddings,
+                n_neighbors,
+                mode='distance',
+                include_self=False,
+                n_jobs=self.n_jobs
+            )
+            G_knn = G0.maximum(G0.T)
+            G_knn.sort_indices()
+        
+        # Check if KNN graph is connected
         self.timing.start("create_knn_graph_with_mst.check_connectivity")
         is_knn_connected = check_graph_connectivity(G_knn)
         if not is_knn_connected:
             n_components, component_labels_knn = connected_components(G_knn, directed=False)
         self.timing.end("create_knn_graph_with_mst.check_connectivity")
-
+        
         if self.verbose:
             if is_knn_connected:
                 print(f"         KNN graph is connected")
             else:
                 print(f"         KNN graph has {n_components} connected components")
-        self.timing.end("create_knn_graph_with_mst.find_nearest_neighbors")
 
+        if not is_knn_connected:
+            from collections import Counter
+            counts = Counter(component_labels_knn)
+            total = sum(counts.values())
+            
+            print("Total nodes:", total)
+            print("Largest 5 components (label → size):")
+            for lbl, sz in counts.most_common(5):
+                print(f"  {lbl:5d} → {sz:8d}")
+            
+            # Maybe also see how many "tiny" islands:
+            tiny = sum(1 for sz in counts.values() if sz < 100)
+            print(f"{tiny} components of size < 100")
+            
+        # If KNN graph has multiple components, we need to add edges to connect them
+        if not is_knn_connected:
+            self.timing.start("create_knn_graph_with_mst.connect_components")
+            if self.verbose:
+                print(f"         Adding edges to connect all components")
+            
+            # Find representatives for each component
+            print('Selecting least connected representatives of each connected component representatives...')
+            component_reps = {}
+            for comp in np.unique(component_labels_knn):
+                nodes = np.where(component_labels_knn == comp)[0]
+                degrees = np.diff(G_knn.indptr)[nodes]
+                boundary = nodes[np.argmin(degrees)]
+                component_reps[comp] = boundary
+            
+            # Create a minimally connected graph between component representatives
+            print('Computing MST of connected component representatives (in embedding)...')
+            # 2. Compute all-pairs Euclidean distances between representatives
+            reps = np.array(list(component_reps.values()))
+            D = cdist(embeddings[reps], embeddings[reps])
+            
+            # 3. MST over meta-graph
+            mst = minimum_spanning_tree(D).toarray()
+            edges_to_add = np.argwhere(mst > 0)
+            
+            # 4. Efficiently batch-update graph (switch to LIL)
+            print('Converting disconnected KNN graph to LIL format...')
+            G_knn = G_knn.tolil()
+            for i, j in edges_to_add:
+                u = reps[i]
+                v = reps[j]
+                dist = D[i, j]
+                G_knn[u, v] = dist
+                G_knn[v, u] = dist  # For undirected graphs
+            print('Converting LIL graph back to CSR format...')
+            G_knn = G_knn.tocsr()
+            G_knn.sort_indices()
+                        
+            # Verify the graph is now connected
+            is_connected_after = check_graph_connectivity(G_knn)
+            if self.verbose:
+                if is_connected_after:
+                    print(f"         After adding edges: graph is connected")
+                else:
+                    print(f"         WARNING: Graph still has disconnected components after attempted repair")
+            self.timing.end("create_knn_graph_with_mst.connect_components")
         
         # Initialize edge tracking
         print("Tracking edges for graph distance computation...")
