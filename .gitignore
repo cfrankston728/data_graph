@@ -13,3 +13,7 @@ dist/
 # Optional: virtualenvs
 .env/
 venv/
+
+# Archive files and works in progress
+.archive/
+.wip/
