@@ -140,6 +140,41 @@ def build_csr_graph(sources: np.ndarray, targets: np.ndarray, n_nodes: int) -> T
     return offsets, neighbors
 
 @nb.njit(cache=True)
+def _build_sym_csr_arrays(n_nodes: int,
+                          src: np.ndarray,
+                          tgt: np.ndarray,
+                          w:   np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # degree (each undirected edge contributes to both endpoints)
+    deg = np.zeros(n_nodes + 1, dtype=np.int64)
+    m = src.size
+    for i in range(m):
+        u = src[i]; v = tgt[i]
+        deg[u + 1] += 1
+        deg[v + 1] += 1
+
+    # prefix sum -> indptr
+    for i in range(1, n_nodes + 1):
+        deg[i] += deg[i - 1]
+    indptr = deg.astype(np.int32)
+
+    nnz = indptr[-1]
+    indices = np.empty(nnz, dtype=np.int32)
+    data    = np.empty(nnz, dtype=np.float32)
+
+    # per-row fill counters
+    fill = np.zeros(n_nodes, dtype=np.int32)
+
+    # write both directions
+    for i in range(m):
+        u = src[i]; v = tgt[i]; ww = w[i]
+
+        p = indptr[u] + fill[u]; indices[p] = v; data[p] = ww; fill[u] += 1
+        p = indptr[v] + fill[v]; indices[p] = u; data[p] = ww; fill[v] += 1
+
+    return indptr, indices, data
+
+
+@nb.njit(cache=True)
 def make_edge_flat(sources: np.ndarray, targets: np.ndarray) -> np.ndarray:
     """Interleave source and target arrays for igraph."""
     n = sources.shape[0]
@@ -149,50 +184,91 @@ def make_edge_flat(sources: np.ndarray, targets: np.ndarray) -> np.ndarray:
         out[2*i+1] = targets[i]
     return out
 
-@nb.njit(cache=True, parallel=True)
+@nb.njit(parallel=True, fastmath=True, cache=True)
 def mutual_nn_coarsening(sources: np.ndarray, targets: np.ndarray, 
-                         weights: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, int]:
-    # Build deg / indptr
-    deg = np.zeros(n_nodes, dtype=np.int32)
-    m = sources.shape[0]
-    for e in range(m):
-        u = sources[e]; v = targets[e]
-        deg[u] += 1; deg[v] += 1
-    indptr = np.zeros(n_nodes + 1, dtype=np.int32)
-    for i in range(n_nodes):
-        indptr[i+1] = indptr[i] + deg[i]
-
-    # Fill neighbors + weights
-    nbrs = np.empty(indptr[-1], dtype=np.int32)
-    wts  = np.empty(indptr[-1], dtype=np.float32)
-    fill = np.zeros(n_nodes, dtype=np.int32)
-    for e in range(m):
-        u = sources[e]; v = targets[e]; w = weights[e]
-        p = indptr[u] + fill[u]; nbrs[p] = v; wts[p] = w; fill[u] += 1
-        p = indptr[v] + fill[v]; nbrs[p] = u; wts[p] = w; fill[v] += 1
-
-    # Best neighbor per node (parallel, independent writes)
+                        weights: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, int]:
+    """Optimized mutual nearest neighbor coarsening."""
     best_neighbor = np.full(n_nodes, -1, dtype=np.int32)
-    for u in nb.prange(n_nodes):
-        start = indptr[u]; end = indptr[u+1]
-        bw = -np.inf; bn = -1
-        for p in range(start, end):
-            w = wts[p]; v = nbrs[p]
-            if w > bw:
-                bw = w; bn = v
-        best_neighbor[u] = bn
-
-    # Assign meta IDs (sequential, deterministic)
+    best_weight = np.full(n_nodes, -np.inf, dtype=np.float32)
+    
+    # Find best neighbors in parallel
+    for i in prange(len(sources)):
+        u, v, w = sources[i], targets[i], weights[i]
+        
+        if w > best_weight[u]:
+            best_weight[u] = w
+            best_neighbor[u] = v
+            
+        if w > best_weight[v]:
+            best_weight[v] = w
+            best_neighbor[v] = u
+    
+    # Assign meta IDs (sequential for correctness)
     meta_id = np.full(n_nodes, -1, dtype=np.int32)
     next_meta = 0
+    
+    # Mutual pairs
     for i in range(n_nodes):
         j = best_neighbor[i]
-        if j >= 0 and j > i and best_neighbor[j] == i and meta_id[i] == -1:
-            meta_id[i] = next_meta; meta_id[j] = next_meta; next_meta += 1
+        if j > i and j >= 0 and best_neighbor[j] == i and meta_id[i] == -1:
+            meta_id[i] = meta_id[j] = next_meta
+            next_meta += 1
+    
+    # Singletons
     for i in range(n_nodes):
         if meta_id[i] == -1:
-            meta_id[i] = next_meta; next_meta += 1
+            meta_id[i] = next_meta
+            next_meta += 1
+    
     return meta_id, next_meta
+
+@nb.njit(parallel=True, cache=True)
+def mutual_nn_coarsening_csr(src: np.ndarray, tgt: np.ndarray, w: np.ndarray, n_nodes: int):
+    # degree per node (count each undirected edge twice)
+    deg = np.zeros(n_nodes, dtype=np.int32)
+    for e in range(src.shape[0]):
+        u = src[e]; v = tgt[e]
+        deg[u] += 1; deg[v] += 1
+
+    # CSR offsets
+    off = np.zeros(n_nodes + 1, dtype=np.int32)
+    for i in range(n_nodes):
+        off[i + 1] = off[i] + deg[i]
+
+    # adjacency (neighbors + weights), both directions
+    neigh = np.empty(off[-1], dtype=np.int32)
+    wts   = np.empty(off[-1], dtype=np.float32)
+    fill  = np.zeros(n_nodes, dtype=np.int32)
+    for e in range(src.shape[0]):
+        u = src[e]; v = tgt[e]; ww = w[e]
+        p = off[u] + fill[u]; neigh[p] = v; wts[p] = ww; fill[u] += 1
+        p = off[v] + fill[v]; neigh[p] = u; wts[p] = ww; fill[v] += 1
+
+    # best neighbor per node (deterministic tie-breaker on smaller id)
+    best  = np.full(n_nodes, -1, dtype=np.int32)
+    bestw = np.full(n_nodes, -np.inf, dtype=np.float32)
+    for i in nb.prange(n_nodes):
+        s = off[i]; e = off[i+1]
+        bi = -1; bw = np.float32(-np.inf)
+        for p in range(s, e):
+            jw = wts[p]; j = neigh[p]
+            if jw > bw or (jw == bw and j < bi):
+                bw = jw; bi = j
+        best[i]  = bi
+        bestw[i] = bw
+
+    # assign meta ids
+    meta = np.full(n_nodes, -1, dtype=np.int32)
+    next_meta = 0
+    for i in range(n_nodes):
+        j = best[i]
+        if j > i and j >= 0 and best[j] == i and meta[i] == -1:
+            meta[i] = next_meta; meta[j] = next_meta; next_meta += 1
+    for i in range(n_nodes):
+        if meta[i] == -1:
+            meta[i] = next_meta; next_meta += 1
+
+    return meta, next_meta
 
 @nb.njit(cache=True)
 def aggregate_edges(src: np.ndarray, tgt: np.ndarray, w: np.ndarray):
@@ -246,17 +322,34 @@ def aggregate_edges(src: np.ndarray, tgt: np.ndarray, w: np.ndarray):
     return out_src, out_tgt, out_w
 
 @nb.njit(cache=True)
-def aggregate_edges_with_distances(src: np.ndarray, tgt: np.ndarray, 
+def aggregate_edges_with_distances(src: np.ndarray, tgt: np.ndarray,
                                   w: np.ndarray, dist: np.ndarray):
-    """Aggregate edges tracking minimum distance."""
+    """Aggregate parallel edges on the undirected pair (a=min, b=max).
+    - Output has one row per undirected pair (a,b).
+    - Weights are SUM(w) over the pair.
+    - Distance is MIN(dist) over the pair.
+    Returns: (out_src, out_tgt, out_w, out_dist)
+    """
     n = src.shape[0]
+
+    # canonicalize (a<=b)
+    a = np.empty(n, dtype=np.int32)
+    b = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        si = src[i]; ti = tgt[i]
+        if si <= ti:
+            a[i] = si; b[i] = ti
+        else:
+            a[i] = ti; b[i] = si
+
+    # 64-bit key per canonical pair
     keys = np.empty(n, dtype=np.int64)
     for i in range(n):
-        keys[i] = (np.int64(src[i]) << 32) | np.int64(tgt[i])
-    
+        keys[i] = (np.int64(a[i]) << 32) | np.int64(b[i])
+
     order = np.argsort(keys)
-    
-    # Count uniques
+
+    # count uniques
     unique_count = 0
     prev = np.int64(-1)
     for idx in order:
@@ -264,17 +357,17 @@ def aggregate_edges_with_distances(src: np.ndarray, tgt: np.ndarray,
         if k != prev:
             unique_count += 1
             prev = k
-    
+
     out_src  = np.empty(unique_count, dtype=np.int32)
     out_tgt  = np.empty(unique_count, dtype=np.int32)
     out_w    = np.empty(unique_count, dtype=np.float32)
     out_dist = np.empty(unique_count, dtype=np.float32)
-    
+
     out_i = 0
     prev  = np.int64(-1)
-    acc_w  = 0.0
-    min_d  = np.inf
-    
+    acc_w = 0.0
+    min_d = np.float32(np.inf)
+
     for pos in order:
         k = keys[pos]
         if k == prev:
@@ -285,47 +378,178 @@ def aggregate_edges_with_distances(src: np.ndarray, tgt: np.ndarray,
             if prev != -1:
                 out_src[out_i]  = np.int32(prev >> 32)
                 out_tgt[out_i]  = np.int32(prev & 0xFFFFFFFF)
-                out_w[out_i]    = acc_w
-                out_dist[out_i] = min_d
+                out_w[out_i]    = np.float32(acc_w)
+                out_dist[out_i] = np.float32(min_d)
                 out_i += 1
-            prev   = k
-            acc_w  = w[pos]
-            min_d  = dist[pos]
-    
-    # Flush last group
+            prev  = k
+            acc_w = w[pos]
+            min_d = dist[pos]
+
+    # flush last
     out_src[out_i]  = np.int32(prev >> 32)
     out_tgt[out_i]  = np.int32(prev & 0xFFFFFFFF)
-    out_w[out_i]    = acc_w
-    out_dist[out_i] = min_d
-    
+    out_w[out_i]    = np.float32(acc_w)
+    out_dist[out_i] = np.float32(min_d)
+
     return out_src, out_tgt, out_w, out_dist
 
-from numba import atomic
+@nb.njit(cache=True)
+def _aggregate_min_distance_pairs(src: np.ndarray, tgt: np.ndarray, dist: np.ndarray):
+    """
+    Aggregate parallel edges on the canonical undirected pair (a=min,b=max).
+    Keep only MIN(distance) per pair.
+    Returns: (out_src, out_tgt, out_dist)
+    """
+    n = src.shape[0]
+    if n == 0:
+        return (np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32))
 
-@nb.njit(cache=True, parallel=True)
+    # canonicalize
+    a = np.empty(n, np.int32)
+    b = np.empty(n, np.int32)
+    for i in range(n):
+        u = src[i]; v = tgt[i]
+        if u <= v:
+            a[i] = u; b[i] = v
+        else:
+            a[i] = v; b[i] = u
+
+    # 64-bit key
+    keys = np.empty(n, np.int64)
+    for i in range(n):
+        keys[i] = (np.int64(a[i]) << 32) | np.int64(b[i])
+
+    order = np.argsort(keys)
+
+    # count uniques
+    unique_count = 0
+    prev = np.int64(-1)
+    for idx in order:
+        k = keys[idx]
+        if k != prev:
+            unique_count += 1
+            prev = k
+
+    out_src  = np.empty(unique_count, np.int32)
+    out_tgt  = np.empty(unique_count, np.int32)
+    out_dist = np.empty(unique_count, np.float32)
+
+    out_i = 0
+    prev  = np.int64(-1)
+    cur_min = np.float32(np.inf)
+
+    for pos in order:
+        k = keys[pos]
+        d = dist[pos]
+        if k == prev:
+            if d < cur_min:
+                cur_min = d
+        else:
+            if prev != -1:
+                out_src[out_i]  = np.int32(prev >> 32)
+                out_tgt[out_i]  = np.int32(prev & 0xFFFFFFFF)
+                out_dist[out_i] = cur_min
+                out_i += 1
+            prev   = k
+            cur_min = d
+
+    # flush
+    out_src[out_i]  = np.int32(prev >> 32)
+    out_tgt[out_i]  = np.int32(prev & 0xFFFFFFFF)
+    out_dist[out_i] = cur_min
+
+    return out_src, out_tgt, out_dist
+
+
+@nb.njit(parallel=True, cache=True)
 def _accumulate_stats(sources, targets, distances, sims, cidx, n_clusters):
+    """Accumulate community statistics in parallel."""
     vol = np.zeros(n_clusters, dtype=np.float64)
     cut = np.zeros(n_clusters, dtype=np.float64)
     int_cnt = np.zeros(n_clusters, dtype=np.int64)
     ext_cnt = np.zeros(n_clusters, dtype=np.int64)
     sum_d = np.zeros(n_clusters, dtype=np.float64)
     sumsq_d = np.zeros(n_clusters, dtype=np.float64)
-
-    for e in nb.prange(sources.shape[0]):
-        u = sources[e]; v = targets[e]
-        du = cidx[u]; dv = cidx[v]
-        w = sims[e]; d = distances[e]
-
-        atomic.add(vol, du, w); atomic.add(vol, dv, w)
+    
+    for e in prange(sources.shape[0]):
+        u = sources[e]
+        v = targets[e]
+        du = cidx[u]
+        dv = cidx[v]
+        w = sims[e]
+        d = distances[e]
+        
+        vol[du] += w
+        vol[dv] += w
+        
         if du == dv:
-            atomic.add(int_cnt, du, 1)
-            atomic.add(sum_d, du, d)
-            atomic.add(sumsq_d, du, d * d)
+            int_cnt[du] += 1
+            sum_d[du] += d
+            sumsq_d[du] += d * d
         else:
-            atomic.add(cut, du, w); atomic.add(cut, dv, w)
-            atomic.add(ext_cnt, du, 1); atomic.add(ext_cnt, dv, 1)
+            cut[du] += w
+            cut[dv] += w
+            ext_cnt[du] += 1
+            ext_cnt[dv] += 1
+    
     return vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d
 
+@nb.njit(parallel=True, cache=True)
+def _accumulate_stats_parallel(sources, targets, distances, sims, cidx, n_clusters):
+    """
+    Parallel, race-free accumulation using per-thread buffers.
+    Returns: vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d
+    """
+    n_edges = sources.shape[0]
+    T = nb.get_num_threads()
+
+    vol     = np.zeros((T, n_clusters), dtype=np.float64)
+    cut     = np.zeros((T, n_clusters), dtype=np.float64)
+    int_cnt = np.zeros((T, n_clusters), dtype=np.int64)
+    ext_cnt = np.zeros((T, n_clusters), dtype=np.int64)
+    sum_d   = np.zeros((T, n_clusters), dtype=np.float64)
+    sumsq_d = np.zeros((T, n_clusters), dtype=np.float64)
+
+    # split work by contiguous chunks to avoid needing a thread_id API inside prange
+    for t in nb.prange(T):
+        start = (t * n_edges) // T
+        end   = ((t + 1) * n_edges) // T
+        for e in range(start, end):
+            u = sources[e]; v = targets[e]
+            du = cidx[u];   dv = cidx[v]
+            w = sims[e];    d  = distances[e]
+
+            vol[t, du] += w
+            vol[t, dv] += w
+
+            if du == dv:
+                int_cnt[t, du] += 1
+                sum_d[t, du]   += d
+                sumsq_d[t, du] += d * d
+            else:
+                cut[t, du] += w
+                cut[t, dv] += w
+                ext_cnt[t, du] += 1
+                ext_cnt[t, dv] += 1
+
+    # reduction
+    out_vol     = np.zeros(n_clusters, dtype=np.float64)
+    out_cut     = np.zeros(n_clusters, dtype=np.float64)
+    out_int_cnt = np.zeros(n_clusters, dtype=np.int64)
+    out_ext_cnt = np.zeros(n_clusters, dtype=np.int64)
+    out_sum_d   = np.zeros(n_clusters, dtype=np.float64)
+    out_sumsq_d = np.zeros(n_clusters, dtype=np.float64)
+
+    for t in range(T):
+        for c in range(n_clusters):
+            out_vol[c]     += vol[t, c]
+            out_cut[c]     += cut[t, c]
+            out_int_cnt[c] += int_cnt[t, c]
+            out_ext_cnt[c] += ext_cnt[t, c]
+            out_sum_d[c]   += sum_d[t, c]
+            out_sumsq_d[c] += sumsq_d[t, c]
+
+    return out_vol, out_cut, out_int_cnt, out_ext_cnt, out_sum_d, out_sumsq_d
 
 
 @nb.njit(parallel=True, cache=True)
@@ -349,8 +573,8 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
     n_edges = len(sources)
     
     # Pre-allocate result arrays
-    is_interface = np.zeros(n_edges, dtype=nb.boolean)
-    edge_types = np.zeros(n_edges, dtype=nb.int8)
+    is_interface = np.zeros(n_edges, dtype=np.bool_)
+    edge_types = np.zeros(n_edges, dtype=np.int8)
     source_clusters = np.zeros(n_edges, dtype=np.int32)
     target_clusters = np.zeros(n_edges, dtype=np.int32)
     
@@ -360,7 +584,7 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
         if c > max_cluster:
             max_cluster = c
     
-    is_pruned = np.zeros(max_cluster + 1, dtype=nb.boolean)
+    is_pruned = np.zeros(max_cluster + 1, dtype=np.bool_)
     for c in pruned_clusters:
         is_pruned[c] = True
     
@@ -369,7 +593,7 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
     cross_count = 0
     pruned_count = 0
     
-    for idx in range(n_edges):
+    for idx in nb.prange(n_edges):
         i = sources[idx]
         j = targets[idx]
         
@@ -396,88 +620,106 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
     return (is_interface, edge_types, source_clusters, target_clusters, 
             interface_count, cross_count, pruned_count)
 
-@nb.njit(cache=True)
+@nb.njit(parallel=True, cache=True)
 def sparsify_knn_fast(sources: np.ndarray, targets: np.ndarray, 
-                      weights: np.ndarray, n_nodes: int, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    # Count deg
+                      weights: np.ndarray, n_nodes: int, k: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """k-NN sparsification per source node using argpartition (O(deg) per row)."""
+    if k <= 0 or n_nodes <= 0 or sources.shape[0] == 0:
+        return (np.empty(0, np.int32), np.empty(0, np.int32),
+                np.empty(0, np.float32), np.empty(0, np.int32))
+
+    # degrees per node
     degrees = np.zeros(n_nodes, dtype=np.int32)
     for i in range(sources.shape[0]):
-        degrees[sources[i]] += 1
+        s = sources[i]
+        if 0 <= s < n_nodes:
+            degrees[s] += 1
 
-    # Offsets
+    # row offsets
     offsets = np.zeros(n_nodes + 1, dtype=np.int32)
     for i in range(n_nodes):
-        offsets[i+1] = offsets[i] + degrees[i]
+        offsets[i + 1] = offsets[i] + degrees[i]
 
-    # Buckets
-    total = sources.shape[0]
-    edge_targets = np.empty(total, dtype=np.int32)
-    edge_weights = np.empty(total, dtype=np.float32)
-    edge_indices = np.empty(total, dtype=np.int32)
+    total_edges = sources.shape[0]
+    row_targets = np.empty(total_edges, dtype=np.int32)
+    row_weights = np.empty(total_edges, dtype=np.float32)
+    row_indices = np.empty(total_edges, dtype=np.int32)
 
-    fill = np.zeros(n_nodes, dtype=np.int32)
-    for e in range(total):
-        u = sources[e]
-        pos = offsets[u] + fill[u]
-        edge_targets[pos] = targets[e]
-        edge_weights[pos] = weights[e]
-        edge_indices[pos] = e
-        fill[u] += 1
+    # refill degrees as counters
+    degrees.fill(0)
+    for e in range(total_edges):
+        s = sources[e]
+        pos = offsets[s] + degrees[s]
+        row_targets[pos] = targets[e]
+        row_weights[pos] = weights[e]
+        row_indices[pos] = e
+        degrees[s] += 1
 
-    # Count kept edges
-    new_edge_count = 0
-    for u in range(n_nodes):
-        deg = offsets[u+1] - offsets[u]
+    # count kept edges
+    kept = 0
+    for node in range(n_nodes):
+        deg = offsets[node + 1] - offsets[node]
         if deg > 0:
-            new_edge_count += min(k, deg)
+            kept += k if deg > k else deg
 
-    sparse_sources = np.empty(new_edge_count, dtype=np.int32)
-    sparse_targets = np.empty(new_edge_count, dtype=np.int32)
-    sparse_weights = np.empty(new_edge_count, dtype=np.float32)
-    sparse_orig_idx = np.empty(new_edge_count, dtype=np.int32)
+    out_src  = np.empty(kept, dtype=np.int32)
+    out_tgt  = np.empty(kept, dtype=np.int32)
+    out_w    = np.empty(kept, dtype=np.float32)
+    out_orig = np.empty(kept, dtype=np.int32)
 
     out = 0
-    for u in range(n_nodes):
-        start = offsets[u]; end = offsets[u+1]
-        deg = end - start
+    for node in range(n_nodes):
+        start = offsets[node]
+        end   = offsets[node + 1]
+        deg   = end - start
         if deg == 0:
             continue
+
+        wts = row_weights[start:end]
+        idx = row_indices[start:end]
+
         if deg <= k:
+            # keep all
             for j in range(deg):
-                sparse_sources[out] = u
-                sparse_targets[out] = edge_targets[start + j]
-                sparse_weights[out] = edge_weights[start + j]
-                sparse_orig_idx[out] = edge_indices[start + j]
+                out_src[out]  = node
+                out_tgt[out]  = row_targets[start + j]
+                out_w[out]    = wts[j]
+                out_orig[out] = idx[j]
                 out += 1
         else:
-            # indices of top-k weights
-            idx_top = np.argpartition(edge_weights[start:end], deg - k)[deg - k:]  # length k
-            for j in range(k):
-                i0 = idx_top[j]
-                sparse_sources[out] = u
-                sparse_targets[out] = edge_targets[start + i0]
-                sparse_weights[out] = edge_weights[start + i0]
-                sparse_orig_idx[out] = edge_indices[start + i0]
+            # top-k by weight (unsorted subset)
+            # position of the k largest are indices >= deg - k
+            part = np.argpartition(wts, deg - k)[deg - k:]  # length k, arbitrary order
+            # stable display/order isn’t needed, but if you want strongest-first:
+            ordk = np.argsort(wts[part])[::-1]
+            for tpos in ordk:
+                j = part[tpos]
+                out_src[out]  = node
+                out_tgt[out]  = row_targets[start + j]
+                out_w[out]    = wts[j]
+                out_orig[out] = idx[j]
                 out += 1
-    return sparse_sources, sparse_targets, sparse_weights, sparse_orig_idx
 
+    return out_src, out_tgt, out_w, out_orig
 
 @njit(parallel=True, cache=True)
-def _sparsify_csr_data(indptr: np.ndarray, data: np.ndarray, k: int):
-    """In-place zeroing of all but the top-k values in each CSR row."""
+def _sparsify_csr_data(indptr, data, k):
     n_rows = indptr.shape[0] - 1
-    for i in prange(n_rows):
-        start = indptr[i]
-        end   = indptr[i + 1]
-        length = end - start
-        if length > k:
-            # Find the (length - k)th smallest pivot
-            row = data[start:end]
-            pivot = np.partition(row, length - k)[length - k]
-            # Zero out any entry below pivot
-            for idx in range(start, end):
-                if data[idx] < pivot:
-                    data[idx] = 0.0
+    for i in nb.prange(n_rows):
+        s, e = indptr[i], indptr[i+1]
+        m = e - s
+        if m > k:
+            # positions of the k largest entries
+            part = np.argpartition(data[s:e], m - k)[m - k:]  # length k
+            keep = np.zeros(m, np.uint8)
+            for idx in part:
+                keep[idx] = 1
+            # zero everything not in 'keep'
+            for j in range(m):
+                if keep[j] == 0:
+                    data[s + j] = 0.0
+
 
 @nb.njit(fastmath=True, cache=True)
 def find_knee_point(x: np.ndarray, y: np.ndarray, S: float = 1.0, 
@@ -557,13 +799,12 @@ class OptimizedGraphLoader:
                 self.csr_indices = data["indices"].astype(np.int32)
         else:
             with perf_monitor.timed_operation("Build+cache CSR"):
-                adj = self.adjacency
-                if not sp.isspmatrix_csr(adj):
-                    adj = adj.tocsr()
-                self.csr_offsets = adj.indptr.astype(np.int32, copy=False)
-                self.csr_indices = adj.indices.astype(np.int32, copy=False)
-                np.savez_compressed(csr_cache, offsets=self.csr_offsets, indices=self.csr_indices)
-
+                adj = self.adjacency.tocsr()
+                self.csr_offsets = adj.indptr.astype(np.int32)
+                self.csr_indices = adj.indices.astype(np.int32)
+                np.savez_compressed(csr_cache,
+                                    offsets=self.csr_offsets,
+                                    indices=self.csr_indices)
         
     @property
     def metadata(self) -> Dict:
@@ -687,7 +928,7 @@ class OptimizedGraphLoader:
         return len(self.edge_arrays[0])
 
     def build_graph_wrapper(self, include_embedding: bool = True):
-        """Returns a wrapper exposing .n_nodes, .node_df and .graph.get_edge_list()"""
+        from types import SimpleNamespace
         class GraphWrapper:
             def __init__(self, loader):
                 self.loader = loader
@@ -696,19 +937,48 @@ class OptimizedGraphLoader:
                     if "UMAP1" not in self.node_df:
                         self.node_df["UMAP1"] = loader.embedding[:, 0]
                         self.node_df["UMAP2"] = loader.embedding[:, 1]
-
-                self.graph = type("GraphObj", (), {
-                    "n_nodes": loader.n_nodes,
-                    "get_edge_list": lambda: [
-                        (int(u), int(v), float(d))
-                        for u, v, d in zip(*loader.edge_arrays)
+                self.graph = SimpleNamespace(
+                    n_nodes=loader.n_nodes,
+                    get_edge_list=lambda: [
+                        (int(u), int(v), float(d)) for u, v, d in zip(*loader.edge_arrays)
                     ]
-                })
+                )
         return GraphWrapper(self)
 
 # ============================================================================
 # OPTIMIZED COMMUNITY ANALYZER
 # ============================================================================
+def _keep_mutual_pairs(s: np.ndarray, t: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    # canonical key per pair
+    a = np.minimum(s, t).astype(np.int64, copy=False)
+    b = np.maximum(s, t).astype(np.int64, copy=False)
+    keys = (a << 32) | b
+
+    order = np.argsort(keys)
+    keep = np.zeros(s.size, dtype=np.bool_)
+    i = 0
+    n = s.size
+    while i < n:
+        j = i + 1
+        # group [i, j) with same key
+        while j < n and keys[order[j]] == keys[order[i]]:
+            j += 1
+        # mutual if we saw both directions inside the group
+        seen_lt = False
+        seen_gt = False
+        for k in range(i, j):
+            e = order[k]
+            if s[e] < t[e]: seen_lt = True
+            else:           seen_gt = True
+            if seen_lt and seen_gt:
+                # mark the tighter of the two directed edges (min distance via idx)
+                # or simply keep both and let the later min-distance aggregation collapse them
+                for k2 in range(i, j):
+                    keep[order[k2]] = True
+                break
+        i = j
+    return keep
+
 
 class OptimizedCommunityAnalyzer:
     """Optimized community detection with minimal memory footprint."""
@@ -729,6 +999,8 @@ class OptimizedCommunityAnalyzer:
         self.verbose = verbose
         self._csr_offsets = None
         self._csr_indices = None
+        self._sym_csr = None  # cache per prepared graph
+        self._full_undirected = None  # (Su, Tu, Du)
 
         # Default similarity function
         if similarity_function is None:
@@ -788,6 +1060,38 @@ class OptimizedCommunityAnalyzer:
     def n_edges(self) -> int:
         return len(self.sources)
     
+    def _invalidate_sym_csr(self):
+        self._sym_csr = None
+    
+    def _get_sym_csr(self) -> sp.csr_matrix:
+        if self._sym_csr is None:
+            indptr, indices, data = _build_sym_csr_arrays(
+                int(self.n_nodes_final),
+                self.coarsened_sources.astype(np.int32, copy=False),
+                self.coarsened_targets.astype(np.int32, copy=False),
+                self.coarsened_weights.astype(np.float32, copy=False),
+            )
+            self._sym_csr = sp.csr_matrix((data, indices, indptr),
+                                          shape=(self.n_nodes_final, self.n_nodes_final))
+            self._sym_csr.sum_duplicates()   # ← add this safety
+            # Safety (should be no self-loops after your canonicalization)
+            self._sym_csr.setdiag(0)
+            self._sym_csr.eliminate_zeros()
+        return self._sym_csr
+    
+    def _get_full_undirected(self):
+        if self._full_undirected is None:
+            Su, Tu, Du = _aggregate_min_distance_pairs(
+                self.full_sources, self.full_targets, self.full_distances
+            )
+            # keep them contiguous for later numba calls
+            self._full_undirected = (
+                np.ascontiguousarray(Su, dtype=np.int32),
+                np.ascontiguousarray(Tu, dtype=np.int32),
+                np.ascontiguousarray(Du, dtype=np.float32),
+            )
+        return self._full_undirected
+    
     def _ensure_csr_built(self):
         if not self._csr_built:
             if self.verbose:
@@ -795,6 +1099,7 @@ class OptimizedCommunityAnalyzer:
             self._csr_offsets = self.loader.csr_offsets
             self._csr_indices = self.loader.csr_indices
             self._csr_built = True
+    
     
     def _ensure_prepared(self):
         """Ensure graph is prepared with coarsening/sparsification."""
@@ -817,83 +1122,150 @@ class OptimizedCommunityAnalyzer:
             self._graph_prepared = True
             self._initialized = True
     
+    def _reset_similarity_scale(self):
+        self._median_cache.clear()
+        self._similarity_cache.clear()
+
     def _apply_pre_coarsening_sparsification(self):
+        """k-NN sparsify on the original/current graph.
+        Keep exactly one undirected edge (u<=v) per pair with MIN(distance).
+        Also sync the sparsified graph into coarsened_* so downstream solvers
+        (CSR / igraph) see the intended edge set even when coarsen=False.
+        """
         if self.verbose:
             print(f"Sparsifying pre-coarsened graph (k={self.sparsify_pre_k})…")
-    
-        with perf_monitor.timed_operation("Pre-coarsened graph sparsification"):
-            # Compute similarities
-            sims = self._compute_similarities(self.full_distances, scale="adaptive")
-    
-            # Run k-NN sparsification
-            s, t, w, orig_idx = sparsify_knn_fast(
-                self.sources,
-                self.targets,
-                sims,
-                self.loader.n_nodes,
-                self.sparsify_pre_k
+
+        k = int(self.sparsify_pre_k) if self.sparsify_pre_k is not None else 0
+        # k<=0: canonicalize to one (u<=v) per pair keeping MIN(distance)
+        if k <= 0:
+            agg_s, agg_t, agg_d = _aggregate_min_distance_pairs(
+                self.sources.astype(np.int32,  copy=False),
+                self.targets.astype(np.int32,  copy=False),
+                self.distances.astype(np.float32, copy=False),
             )
-    
-            # Mirror to make undirected
-            mask = s != t
-            new_sources = np.concatenate([s, t[mask]])
-            new_targets = np.concatenate([t, s[mask]])
-            new_orig    = np.concatenate([orig_idx, orig_idx[mask]])
-    
-            # Update arrays
-            self.sources   = new_sources
-            self.targets   = new_targets
-            self.distances = self.full_distances[new_orig]
-    
+            self.sources   = np.ascontiguousarray(agg_s, dtype=np.int32)
+            self.targets   = np.ascontiguousarray(agg_t, dtype=np.int32)
+            self.distances = np.ascontiguousarray(agg_d, dtype=np.float32)
+
+            self._reset_similarity_scale()
+
+            # sync to coarsened_* so CSR / igraph see this canonicalized graph
+            self.coarsened_sources  = self.sources
+            self.coarsened_targets  = self.targets
+            self.coarsened_weights  = self._compute_similarities(self.distances, scale="adaptive")
+            self.n_nodes_final      = self.loader.n_nodes
+            self._invalidate_sym_csr()
+
             if self.verbose:
-                print(f"  Sparsified pre-coarsened graph to {len(self.sources):,} edges")
+                print("  k<=0 → no sparsify, but canonicalized to unique undirected pairs (min distance).")
+            return
+
+        with perf_monitor.timed_operation("Pre-coarsened graph sparsification"):
+            # Similarities aligned to the *current* edge list for k-NN selection
+            sims = self._compute_similarities(self.distances, scale="adaptive")
+
+            # Per-source top-k by similarity (directed selection)
+            s, t, _w_unused, orig_idx = sparsify_knn_fast(
+                self.sources.astype(np.int32),
+                self.targets.astype(np.int32),
+                sims.astype(np.float32),
+                self.loader.n_nodes,
+                k
+            )
+
+            # Distances for selected directed edges
+            dist_kept = self.distances[orig_idx].astype(np.float32)
+
+            # Collapse to canonical undirected pairs, keeping MIN(distance)
+            agg_s, agg_t, agg_d = _aggregate_min_distance_pairs(
+                s.astype(np.int32), t.astype(np.int32), dist_kept
+            )
+
+            # Update the analyzer's "current/original" graph arrays
+            self.sources   = np.ascontiguousarray(agg_s, dtype=np.int32)
+            self.targets   = np.ascontiguousarray(agg_t, dtype=np.int32)
+            self.distances = np.ascontiguousarray(agg_d, dtype=np.float32)
+
+            # Similarity caches are invalid after topology/weights change
+            self._reset_similarity_scale()
+
+            # **(2) Sync to coarsened_* so CSR/igraph solvers see this sparsified graph
+            self.coarsened_sources = self.sources
+            self.coarsened_targets = self.targets
+            self.coarsened_weights = self._compute_similarities(self.distances, scale="adaptive")
+            self.n_nodes_final     = self.loader.n_nodes  # node count unchanged
+
+            self._invalidate_sym_csr()
+            if self.verbose:
+                print(f"  Sparsified pre-coarsened graph to {len(self.sources):,} edges "
+                    f"and synced to coarsened_*")
+
                 
     def _apply_post_coarsened_sparsification(self):
-        """Sparsify the coarsened graph."""
+        """k-NN sparsify on the *coarsened* graph, keep one undirected edge per pair,
+        recompute weights from the new (min) distances."""
         if self.verbose:
             print(f"Sparsifying post-coarsened graph (k={self.sparsify_post_k})…")
 
-        with perf_monitor.timed_operation("Graph sparsification"):
-            src_arr  = self.coarsened_sources
-            tgt_arr  = self.coarsened_targets
-            dist_arr = self.distances
-            n_nodes  = self.n_nodes_final
-            
+        k = int(self.sparsify_post_k) if self.sparsify_post_k is not None else 0
+        if k <= 0:
+            # no-op; ensure weights match current distances
+            self.coarsened_weights = self._compute_similarities(self.distances, scale="adaptive")
+            if self.verbose:
+                print("  k<=0 → skipping post-coarsening sparsification")
+            return
+
+        with perf_monitor.timed_operation("Post-coarsened graph sparsification"):
+            src_arr  = self.coarsened_sources.astype(np.int32)
+            tgt_arr  = self.coarsened_targets.astype(np.int32)
+            dist_arr = self.distances.astype(np.float32)
+            n_nodes  = int(self.n_nodes_final)
+
             sims = self._compute_similarities(dist_arr, scale="adaptive")
 
-            # k-NN sparsification
-            s, t, w, orig_idx = sparsify_knn_fast(
-                src_arr, tgt_arr, sims, n_nodes, self.sparsify_post_k
+            s, t, _w_unused, orig_idx = sparsify_knn_fast(
+                src_arr, tgt_arr, sims.astype(np.float32), n_nodes, k
             )
 
-            # Mirror
-            mask = s != t
-            new_src = np.concatenate([s, t[mask]])
-            new_tgt = np.concatenate([t, s[mask]])
-            new_orig = np.concatenate([orig_idx, orig_idx[mask]])
+            if s.size == 0:
+                # nothing selected; clear edge set
+                self.coarsened_sources = np.empty(0, np.int32)
+                self.coarsened_targets = np.empty(0, np.int32)
+                self.distances         = np.empty(0, np.float32)
+                self.coarsened_weights = np.empty(0, np.float32)
+                self._reset_similarity_scale()
+                if self.verbose:
+                    print("  No edges kept after k-NN (empty graph).")
+                return
 
-            new_dist = dist_arr[new_orig]
+            new_dist = dist_arr[orig_idx].astype(np.float32)
 
-            # Update arrays
-            self.coarsened_sources = new_src
-            self.coarsened_targets = new_tgt
-            self.distances = new_dist
-            self.coarsened_weights = self._compute_similarities(new_dist, scale="adaptive")
+            agg_s, agg_t, agg_dist = _aggregate_min_distance_pairs(
+                s.astype(np.int32), t.astype(np.int32), new_dist
+            )
 
+            self.coarsened_sources = np.ascontiguousarray(agg_s,   dtype=np.int32)
+            self.coarsened_targets = np.ascontiguousarray(agg_t,   dtype=np.int32)
+            self.distances         = np.ascontiguousarray(agg_dist, dtype=np.float32)
+            self.coarsened_weights = self._compute_similarities(self.distances, scale="adaptive")
+            self._reset_similarity_scale()
+            self._invalidate_sym_csr()
             if self.verbose:
-                print(f"  Sparsified to {len(new_src):,} edges")
-
-    def _gaussian_similarity(self, distances: np.ndarray, scale: Union[float, str] = 'adaptive') -> np.ndarray:
-        """Gaussian similarity with adaptive scaling."""
-        if isinstance(scale, str) and scale == 'adaptive':
-            # Cache median for performance
-            if len(self._median_cache) == 0:
-                self._median_cache['global'] = float(np.median(self.distances))
+                print(f"  Sparsified to {len(self.coarsened_sources):,} edges")
+    
+    def _gaussian_similarity(self, distances, scale='adaptive'):
+        if scale == 'adaptive':
+            if 'global' not in self._median_cache:
+                m = float(np.median(self.distances))
+                if not np.isfinite(m) or m <= 0:
+                    m = 1e-8
+                self._median_cache['global'] = m
             scale = self._median_cache['global']
         elif scale is None:
-            scale = float(np.median(distances))
-        
+            m = float(np.median(distances))
+            scale = m if (np.isfinite(m) and m > 0) else 1e-8
         return np.exp(-(distances/scale)**2/2).astype(np.float32)
+
         
     def _compute_similarities(self, distances: np.ndarray, scale: Union[float, str] = 'adaptive') -> np.ndarray:
         """Compute similarities with caching."""
@@ -906,32 +1278,29 @@ class OptimizedCommunityAnalyzer:
         return self._similarity_cache[cache_key]
     
     def _apply_coarsening(self):
-        """Apply coarsening with memory-efficient operations."""
+        """Apply coarsening with memory-efficient operations (no mirroring; min-dist aggregation)."""
         if self.verbose:
             print(f"Applying {self.coarsen_levels} levels of coarsening…")
 
-        current_sources = self.sources
-        current_targets = self.targets
-        current_weights = self._compute_similarities(self.distances)
-        current_distances = self.distances.copy()
-        current_n_nodes = self.loader.n_nodes
-        cumulative_mapping = np.arange(current_n_nodes, dtype=np.int32)
+        cur_src = self.sources
+        cur_tgt = self.targets
+        cur_w   = self._compute_similarities(self.distances)   # needed for MNN selection
+        cur_d   = self.distances.copy()
+        cur_n   = self.loader.n_nodes
+
+        cumulative_mapping = np.arange(cur_n, dtype=np.int32)
         self.coarsening_hierarchy = []
 
         for level in range(self.coarsen_levels):
             if self.verbose:
-                print(f"  Level {level+1}: {current_n_nodes} nodes")
+                print(f"  Level {level+1}: {cur_n} nodes")
 
-            # Mutual-NN coarsening
-            meta_id, n_meta = mutual_nn_coarsening(
-                current_sources, current_targets, current_weights, current_n_nodes
-            )
-            ratio = n_meta / current_n_nodes
+            # 1) Mutual-NN on current graph (uses weights)
+            meta_id, n_meta = mutual_nn_coarsening_csr(cur_src, cur_tgt, cur_w, cur_n)
+            ratio = n_meta / cur_n
             self.coarsening_hierarchy.append({
-                'level': level,
-                'original_nodes': current_n_nodes,
-                'coarsened_nodes': n_meta,
-                'reduction_ratio': ratio
+                'level': level, 'original_nodes': cur_n,
+                'coarsened_nodes': n_meta, 'reduction_ratio': ratio
             })
             if self.verbose:
                 print(f"    → {n_meta} meta-nodes (ratio: {ratio:.3f})")
@@ -940,120 +1309,55 @@ class OptimizedCommunityAnalyzer:
                     print("    Stopping early")
                 break
 
-            # Build meta-edges
+            # 2) Build meta edges (no mirroring)
             if self.verbose:
                 print("    Building meta-edges...")
-            ms = meta_id[current_sources]
-            mt = meta_id[current_targets]
+            ms = meta_id[cur_src]
+            mt = meta_id[cur_tgt]
             keep = ms != mt
-            ms, mt = ms[keep], mt[keep]
-            mw = current_weights[keep]
-            md = current_distances[keep]
+            ms = ms[keep]; mt = mt[keep]; md = cur_d[keep]
 
-            # Vectorized symmetric edge construction
-            mirror = ms != mt
-            n_edges = len(ms)
-            n_mirror = np.sum(mirror)
-            total_edges = n_edges + n_mirror
-
-            s2 = np.empty(total_edges, dtype=np.int32)
-            t2 = np.empty(total_edges, dtype=np.int32)
-            w2 = np.empty(total_edges, dtype=np.float32)
-            d2 = np.empty(total_edges, dtype=np.float32)
-
-            # Original edges
-            s2[:n_edges] = ms
-            t2[:n_edges] = mt
-            w2[:n_edges] = mw
-            d2[:n_edges] = md
-
-            # Mirrored edges
-            s2[n_edges:] = mt[mirror]
-            t2[n_edges:] = ms[mirror]
-            w2[n_edges:] = mw[mirror]
-            d2[n_edges:] = md[mirror]
-
-            # Aggregate edges
+            # 3) Aggregate by canonical pair, keep MIN distance
             if self.verbose:
-                print("    Aggregating edges...")
-            curr_src, curr_tgt, curr_w, curr_d = aggregate_edges_with_distances(s2, t2, w2, d2)
+                print("    Aggregating edges (min distance per pair)...")
+            nxt_src, nxt_tgt, nxt_d = _aggregate_min_distance_pairs(ms, mt, md)
 
-            # Update for next level
+            # 4) Recompute weights from aggregated distances (cheap O(E))
+            nxt_w = self._compute_similarities(nxt_d, scale="adaptive")
+
+            # 5) Advance
             cumulative_mapping = meta_id[cumulative_mapping]
-            current_n_nodes = n_meta
-            current_sources = curr_src
-            current_targets = curr_tgt
-            current_weights = curr_w
-            current_distances = curr_d
-
+            cur_n  = n_meta
+            cur_src, cur_tgt = nxt_src, nxt_tgt
+            cur_d,   cur_w   = nxt_d,   nxt_w
+            self._invalidate_sym_csr()
             if self.verbose:
-                print(f"    → Aggregated to {len(curr_src)} edges")
+                print(f"    → Aggregated to {len(cur_src)} edges")
 
-        # Store final state
+        # Finalize
         self.coarsened = True
         self.meta_id = cumulative_mapping
-        self.n_nodes_final = current_n_nodes
-        self.coarsening_ratio = current_n_nodes / self.loader.n_nodes
-        self.coarsened_sources = current_sources
-        self.coarsened_targets = current_targets
-        self.coarsened_weights = current_weights
-        self.distances = current_distances
-        
-        # Apply post-coarsening sparsification
+        self.n_nodes_final = cur_n
+        self.coarsening_ratio = cur_n / self.loader.n_nodes
+        self.coarsened_sources = cur_src
+        self.coarsened_targets = cur_tgt
+        self.coarsened_weights = cur_w
+        self.distances = cur_d
+        self._reset_similarity_scale()
+
+        # Post-coarsening sparsify
         self.previous_sparsify_post_k = self.sparsify_post_k
         if self.previous_sparsify_post_k is None:
-            self.sparsify_post_k = int(self.sparsify_pre_k * self.coarsening_ratio)
+            self.sparsify_post_k = max(1, int(self.sparsify_post_k or self.sparsify_pre_k) * self.coarsening_ratio)
         else:
-            self.sparsify_post_k = int(self.previous_sparsify_post_k * self.coarsening_ratio)
+            self.sparsify_post_k = max(1, int(self.previous_sparsify_post_k * self.coarsening_ratio))
         self._apply_post_coarsened_sparsification()
-    
-    def _project_labels_to_coarse_mode(self, fine_labels: np.ndarray) -> np.ndarray:
-        """
-        Project fine-level labels (size = |V|) to the current coarse graph (size = |V'|)
-        by taking the mode (majority label) over each meta-node's members.
-
-        - Deterministic: ties break toward the smallest label (via np.unique sorting).
-        - If the graph is not coarsened, returns a copy of the input.
-        """
-        if not self.coarsened or self.meta_id is None:
-            return fine_labels.copy()
-
-        if fine_labels.shape[0] != self.loader.n_nodes:
-            raise ValueError(
-                f"fine_labels has length {fine_labels.shape[0]}, "
-                f"but loader.n_nodes is {self.loader.n_nodes}."
-            )
-
-        n_meta = int(self.n_nodes_final)
-        coarse = np.empty(n_meta, dtype=np.int32)
-
-        # Group once by meta_id (sorted), then take a mode per group.
-        order = np.argsort(self.meta_id)
-        meta_sorted = self.meta_id[order]
-        labels_sorted = fine_labels[order]
-
-        # Boundaries where meta id changes, with sentinels at ends.
-        boundaries = np.flatnonzero(
-            np.concatenate((
-                np.array([True]),
-                meta_sorted[1:] != meta_sorted[:-1],
-                np.array([True])
-            ))
-        )
-
-        for g in range(boundaries.shape[0] - 1):
-            start = boundaries[g]
-            end = boundaries[g + 1]
-            vals, counts = np.unique(labels_sorted[start:end], return_counts=True)
-            # np.unique sorts vals ascending; argmax picks first max → deterministic tie-break
-            coarse[meta_sorted[start]] = np.int32(vals[np.argmax(counts)])
-
-        return coarse
 
     def _create_igraph(self):
         """Create igraph from current graph data."""
         import igraph as ig  # Lazy import
-        
+        ig.set_random_number_generator(ig.RandomNumberGenerator(42))
+
         if self.verbose:
             print("Creating igraph...")
         
@@ -1076,97 +1380,105 @@ class OptimizedCommunityAnalyzer:
                 print("  Created igraph using list approach")
     
     def run_leiden_igraph(self, resolution: float, run_id: str = None, 
-                      scale: Union[float, str] = 'adaptive',
-                      initial_membership: Optional[np.ndarray] = None,
-                      rank_stat_col: Optional[str] = None,
-                      prune_small_clusters: bool = False,
-                      min_cluster_size: Optional[int] = None,
-                      knee_sensitivity: float = 1.0,
-                      normalize_rank_stat: bool = True,
-                      reassign_pruned: bool = False,
-                      output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
-        """Run Leiden with optional warm start (Louvain cold-start fallback)."""
+                         scale: Union[float, str] = 'adaptive',
+                         initial_membership: Optional[np.ndarray] = None,
+                         rank_stat_col: Optional[str] = None,
+                         prune_small_clusters: bool = False,
+                         min_cluster_size: Optional[int] = None,
+                         knee_sensitivity: float = 1.0,
+                         normalize_rank_stat: bool = True,
+                         reassign_pruned: bool = False,
+                         output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
+        """Run Leiden with Louvain cold-start."""
         import igraph as ig
         import leidenalg
-
-        # Ensure graph is prepared and exists
+        
+        # Ensure graph is prepared
         self._ensure_prepared()
+        
+        # Create igraph if not already created
         if not hasattr(self, 'igraph'):
             self._create_igraph()
-
-        # Run / output naming
+    
+        # Generate run_id and output prefix
         if run_id is None:
             run_id = f"leiden_res{resolution:.3f}"
         if output_prefix is None:
             output_prefix = f"leiden_{run_id}_"
-
+    
         if self.verbose:
             print(f"\n--- Running Leiden with resolution={resolution} ---")
-
+    
         with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
-            # Always set the weights for the *current* graph (fine or coarsened)
-            sims = self._compute_similarities(self.distances, scale)
-            self.igraph.es['weight'] = sims.tolist()
-
-            # Prepare warm start:
-            # - If provided at fine-level and we are coarsened, project via mode.
-            # - If provided at coarse-level, length must match current graph.
-            # - If not provided, use Louvain memberships as a cold start.
-            if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != self.n_nodes_final:
-                    raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, "
-                        f"expected {self.loader.n_nodes} (fine) or {self.n_nodes_final} (coarse)."
-                    )
-            else:
+            # Cold-start with Louvain if no initial membership
+            if initial_membership is None:
                 if self.verbose:
                     print("  Cold-start Louvain…")
                 louvain_part = self.igraph.community_multilevel(weights=self.igraph.es['weight'])
                 initial_membership = np.array(louvain_part.membership, dtype=np.int32)
-
-            # Leiden with warm-start
+                leiden_iters = 5
+            else:
+                leiden_iters = 5
+    
+            # Set edge weights
+            if not self.coarsened:
+                sims = self._compute_similarities(self.distances, scale)
+                self.igraph.es['weight'] = sims.tolist()
+    
+            # Handle warm-start projection
+            if self.coarsened and initial_membership is not None \
+               and initial_membership.shape[0] == self.loader.n_nodes:
+                coarse_init = np.zeros(self.n_nodes_final, dtype=np.int32)
+                for i in range(self.loader.n_nodes):
+                    coarse_init[self.meta_id[i]] = initial_membership[i]
+                initial_membership = coarse_init
+    
+            # Run Leiden
+            partition_kwargs = {
+                'resolution_parameter': float(resolution),
+                'weights': 'weight',
+                'n_iterations': leiden_iters
+            }
+            if initial_membership is not None:
+                partition_kwargs['initial_membership'] = initial_membership.tolist()
+    
             partition = leidenalg.find_partition(
                 self.igraph,
                 leidenalg.RBConfigurationVertexPartition,
-                resolution_parameter=float(resolution),
-                weights='weight',
-                n_iterations=5,
-                initial_membership=initial_membership.tolist()
+                **partition_kwargs
             )
             labels = np.array(partition.membership, dtype=np.int32)
-
-            # If we ran on a coarsened graph, project labels back to fine level
+    
+            # Project labels back if coarsened
             if self.coarsened:
                 full_labels = np.zeros(self.loader.n_nodes, dtype=np.int32)
                 for i in range(self.loader.n_nodes):
                     full_labels[i] = labels[self.meta_id[i]]
                 labels = full_labels
-
+    
             if self.verbose:
                 n_clusters = len(np.unique(labels))
                 print(f"Found {n_clusters} communities")
-
+    
         # Process results
         with perf_monitor.timed_operation("Process cluster labels"):
             df = self.loader.node_df.copy()
             cluster_col = f'{output_prefix}cluster'
             rank_col = f'{output_prefix}rank'
             df[cluster_col] = labels
-
+    
         with perf_monitor.timed_operation("Process cluster statistics"):
             cluster_stats, pruning_info = self._process_cluster_stats(
                 df, labels, cluster_col, rank_col, rank_stat_col,
                 normalize_rank_stat, prune_small_clusters,
                 min_cluster_size, knee_sensitivity, reassign_pruned
             )
-
+    
         with perf_monitor.timed_operation("Identify interface edges"):
             interface_edges_df = self._identify_interface_edges(
                 df, cluster_col, pruning_info.get('pruned_clusters', []), scale
             )
-
+    
         with perf_monitor.timed_operation("Store run results"):
             self.runs[run_id] = {
                 'df': df,
@@ -1181,9 +1493,8 @@ class OptimizedCommunityAnalyzer:
                 'coarsening_ratio': self.coarsening_ratio if self.coarsened else None
             }
             self.interface_edges[run_id] = interface_edges_df
-
+    
         return cluster_stats, labels
-
 
     def run_louvain_csr(self, resolution: float, run_id: str = None,
                        scale: Union[float, str] = 'adaptive',
@@ -1220,23 +1531,22 @@ class OptimizedCommunityAnalyzer:
             print(f"\n--- Running CSR-native Louvain with resolution={resolution} ---")
         
         with perf_monitor.timed_operation(f"Louvain clustering (res={resolution})"):
-            # Create CSR matrix
-            csr = sp.csr_matrix(
-                (self.coarsened_weights.astype(np.float32),
-                 (self.coarsened_sources.astype(np.int32), 
-                  self.coarsened_targets.astype(np.int32))),
-                shape=(self.n_nodes_final, self.n_nodes_final)
-            )
+            csr = self._get_sym_csr()
+            if self.verbose:
+                n = csr.shape[0]
+                density = (csr.nnz / (n * (n - 1))) if n > 1 else 0.0
+                print(f"  CSR shape: {csr.shape}, nnz: {csr.nnz:,}, density≈{density:.3e}")
             
             # Handle warm-start if provided
-            if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != self.n_nodes_final:
-                    raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, "
-                        f"expected {self.loader.n_nodes} (fine) or {self.n_nodes_final} (coarse)."
-                    )
+            if initial_membership is not None and self.verbose:
+                print("  (Note) initial_membership is currently ignored by scikit-network CSR solvers. This will be addressed in future versions.")
+
+            if initial_membership is not None and self.coarsened \
+               and initial_membership.shape[0] == self.loader.n_nodes:
+                coarse_init = np.zeros(self.n_nodes_final, dtype=np.int32)
+                for i in range(self.loader.n_nodes):
+                    coarse_init[self.meta_id[i]] = initial_membership[i]
+                initial_membership = coarse_init
             
             # Run Louvain
             louvain = Louvain(
@@ -1319,7 +1629,8 @@ class OptimizedCommunityAnalyzer:
                       knee_sensitivity: float = 1.0,
                       normalize_rank_stat: bool = True,
                       reassign_pruned: bool = False,
-                      output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
+                      output_prefix: Optional[str] = None,
+                      collect_interface_df: bool = False) -> Tuple[pd.DataFrame, np.ndarray]:
         """Run CSR-native Leiden community detection."""
         try:
             from sknetwork.clustering import Leiden
@@ -1345,23 +1656,23 @@ class OptimizedCommunityAnalyzer:
             print(f"\n--- Running CSR-native Leiden with resolution={resolution} ---")
         
         with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
-            # Create CSR matrix
-            csr = sp.csr_matrix(
-                (self.coarsened_weights.astype(np.float32),
-                 (self.coarsened_sources.astype(np.int32), 
-                  self.coarsened_targets.astype(np.int32))),
-                shape=(self.n_nodes_final, self.n_nodes_final)
-            )
+            # make truly undirected without duplicating arrays in Python
+            csr = self._get_sym_csr()
+            if self.verbose:
+                n = csr.shape[0]
+                density = (csr.nnz / (n * (n - 1))) if n > 1 else 0.0
+                print(f"  CSR shape: {csr.shape}, nnz: {csr.nnz:,}, density≈{density:.3e}")
             
+            # Handle warm-start if provided            
+            if initial_membership is not None and self.verbose:
+                print("  (Note) initial_membership is currently ignored by scikit-network CSR solvers. This will be addressed in future versions.")
             # Handle warm-start if provided
-            if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != self.n_nodes_final:
-                    raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, "
-                        f"expected {self.loader.n_nodes} (fine) or {self.n_nodes_final} (coarse)."
-                    )
+            if initial_membership is not None and self.coarsened \
+               and initial_membership.shape[0] == self.loader.n_nodes:
+                coarse_init = np.zeros(self.n_nodes_final, dtype=np.int32)
+                for i in range(self.loader.n_nodes):
+                    coarse_init[self.meta_id[i]] = initial_membership[i]
+                initial_membership = coarse_init
             
             # Run Leiden
             leiden = Leiden(
@@ -1413,9 +1724,22 @@ class OptimizedCommunityAnalyzer:
             )
     
         with perf_monitor.timed_operation("Identify interface edges"):
-            interface_edges_df = self._identify_interface_edges(
-                df, cluster_col, pruning_info.get('pruned_clusters', []), scale
-            )
+            if collect_interface_df:
+                interface_edges_df = self._identify_interface_edges(
+                    df, cluster_col, pruning_info.get('pruned_clusters', []), scale
+                )
+                self.interface_edges[run_id] = interface_edges_df
+            else:
+                # store only counts to keep diagnostics lightweight
+                sources, targets, distances = self.full_sources, self.full_targets, self.full_distances
+                similarities = self._compute_similarities(distances, scale)
+                pruned_arr = np.array(list(pruning_info.get('pruned_clusters', [])), dtype=np.int32)
+                (is_iface, edge_types, _sc, _tc, tot, cross, pruned) = identify_interface_edges_detailed(
+                    sources, targets, distances, similarities, df[cluster_col].values, pruned_arr
+                )
+                self.interface_edges[run_id] = {'count': int(tot), 'cross': int(cross), 'pruned': int(pruned)}
+                if self.verbose:
+                    print(f"Found {tot} interface edges ({cross} cross, {pruned} pruned)")
     
         with perf_monitor.timed_operation("Store run results"):
             self.runs[run_id] = {
@@ -1578,6 +1902,7 @@ class OptimizedCommunityAnalyzer:
     
     def _reassign_pruned_nodes(self, df, cluster_col, pruned_clusters, kept_clusters):
         """Reassign nodes from pruned clusters to nearest large cluster."""
+        self._ensure_csr_built()
         if self.verbose:
             print(f"Reassigning nodes from pruned clusters...")
         
@@ -1727,56 +2052,75 @@ class OptimizedCommunityAnalyzer:
             raise ValueError("No runs available to combine")
 
         with perf_monitor.timed_operation("Combine edge data"):
-            # edge -> first index map on full graph (canonicalized)
-            full_map = {}
-            for idx in range(self.full_sources.shape[0]):
-                s = int(self.full_sources[idx]); t = int(self.full_targets[idx])
-                if s == t:
-                    continue
-                key = (s, t) if s < t else (t, s)
-                if key not in full_map:
-                    full_map[key] = idx
-
-            # union of all interface edges
+            # 1) union of interface edges across runs (canonicalized)
             all_edges = set()
-            per_run_type = {rid: {} for rid in run_ids}
-            for rid in run_ids:
-                if rid not in self.interface_edges:
+            for run_id in run_ids:
+                if run_id not in self.interface_edges:
                     continue
-                df = self.interface_edges[rid]
-                for i in range(len(df)):
-                    a = int(df.iloc[i]['source']); b = int(df.iloc[i]['target'])
-                    key = (a, b) if a < b else (b, a)
-                    all_edges.add(key)
-                    per_run_type[rid][key] = df.iloc[i]['edge_type']
+                edges_df = self.interface_edges[run_id]
+                s = edges_df['source'].to_numpy(dtype=np.int64, copy=False)
+                t = edges_df['target'].to_numpy(dtype=np.int64, copy=False)
+                for i in range(s.shape[0]):
+                    u = int(s[i]); v = int(t[i])
+                    if u <= v:
+                        all_edges.add((u, v))
+                    else:
+                        all_edges.add((v, u))
 
-            combined = []
-            for key in all_edges:
-                idx = full_map.get(key, -1)
-                if idx < 0:
+            # 2) build canonical edge -> index (choose minimal distance)
+            S = self.full_sources
+            T = self.full_targets
+            D = self.full_distances
+            edge_to_idx = {}  # (u,v) -> idx into S/T/D
+            for i in range(S.shape[0]):
+                u = int(S[i]); v = int(T[i])
+                a = u if u <= v else v
+                b = v if u <= v else u
+                prev = edge_to_idx.get((a, b), -1)
+                if prev == -1 or D[i] < D[prev]:
+                    edge_to_idx[(a, b)] = i
+
+            # 3) map run_id -> {edge -> type}
+            edge_types = {run_id: {} for run_id in run_ids}
+            for run_id in run_ids:
+                if run_id not in self.interface_edges:
                     continue
+                df = self.interface_edges[run_id]
+                # use canonical keys
+                for _, row in df.iterrows():
+                    u = int(row['source']); v = int(row['target'])
+                    a, b = (u, v) if u <= v else (v, u)
+                    edge_types[run_id][(a, b)] = row['edge_type']
+
+            # 4) assemble combined rows
+            combined = []
+            for (u, v) in all_edges:
+                idx = edge_to_idx.get((u, v), None)
+                if idx is None:
+                    continue  # edge not found in the full list (shouldn't happen)
                 row = {
-                    'source': key[0],
-                    'target': key[1],
-                    'distance': float(self.full_distances[idx])
+                    'source': u,
+                    'target': v,
+                    'distance': float(D[idx]),
                 }
                 in_any = False
-                for rid in run_ids:
-                    present = key in per_run_type[rid]
-                    row[f'in_{rid}'] = present
-                    row[f'type_{rid}'] = per_run_type[rid].get(key, 'not_interface')
-                    if present:
-                        in_any = True
+                for run_id in run_ids:
+                    present = (run_id in edge_types) and ((u, v) in edge_types[run_id])
+                    row[f'in_{run_id}'] = present
+                    row[f'type_{run_id}'] = edge_types[run_id].get((u, v), 'not_interface')
+                    in_any |= present
                 if in_any:
-                    row['run_count'] = sum(1 for rid in run_ids if row[f'in_{rid}'])
+                    row['run_count'] = sum(1 for run_id in run_ids if row[f'in_{run_id}'])
                     combined.append(row)
+
             self.combined_edges = pd.DataFrame(combined)
 
-            if self.verbose and len(self.combined_edges) > 0:
-                vc = self.combined_edges['run_count'].value_counts().sort_index()
+            if self.verbose and not self.combined_edges.empty:
+                rc = self.combined_edges['run_count'].value_counts().sort_index()
                 print("Edge counts by number of runs:")
-                for k, v in vc.items():
+                for k, v in rc.items():
                     print(f"  - In {k}/{len(run_ids)} runs: {v} edges")
+
             return self.combined_edges
 
     
@@ -1808,16 +2152,14 @@ class OptimizedCommunityAnalyzer:
             cluster_idx = np.array([id_to_idx[int(l)] for l in labels], dtype=np.int32)
     
             # Full edge lists
-            S = self.full_sources
-            T = self.full_targets
-            D = self.full_distances
-            sims = self._compute_similarities(D, run_data.get('similarity_scale', 'adaptive'))
-    
-            # Accumulate stats using Numba
-            vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d = _accumulate_stats(
-                S, T, D, sims, cluster_idx, n_clusters
+            S, T, D = self.full_sources, self.full_targets, self.full_distances
+            Su, Tu, Du = self._get_full_undirected()
+            sims = self._compute_similarities(Du, run_data.get('similarity_scale', 'adaptive'))
+
+            vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d = _accumulate_stats_parallel(
+                Su, Tu, Du, sims, cluster_idx, n_clusters
             )
-    
+
             # Post-process
             mean_int = np.zeros(n_clusters, dtype=np.float64)
             std_int = np.zeros(n_clusters, dtype=np.float64)
@@ -1932,7 +2274,13 @@ class OptimizedCommunityAnalyzer:
         """Create visualization comparing communities across runs."""
         # Lazy import matplotlib
         import matplotlib.pyplot as plt
-        import seaborn as sns
+        try:
+            import seaborn as sns
+        except Exception:
+            sns = None
+        
+        if plot_type in ('edge_heatmap','community_overlap') and sns is None:
+            raise RuntimeError("Plot type requires seaborn; pip install seaborn")
         
         if run_ids is None:
             run_ids = list(self.runs.keys())
@@ -2328,7 +2676,6 @@ def main(location, output_dir, run_name, resolutions, similarity_scale,
          min_cluster_size, rank_stat_col, timing, algorithm):
     """Optimized community detection pipeline."""
     # Configure performance monitoring
-    np.random.seed(42)
     global perf_monitor
     perf_monitor.enabled = timing
     perf_monitor.reset()

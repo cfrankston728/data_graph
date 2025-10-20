@@ -149,49 +149,42 @@ def make_edge_flat(sources: np.ndarray, targets: np.ndarray) -> np.ndarray:
         out[2*i+1] = targets[i]
     return out
 
-@nb.njit(cache=True, parallel=True)
+@nb.njit(parallel=True, fastmath=True, cache=True)
 def mutual_nn_coarsening(sources: np.ndarray, targets: np.ndarray, 
-                         weights: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, int]:
-    # Build deg / indptr
-    deg = np.zeros(n_nodes, dtype=np.int32)
-    m = sources.shape[0]
-    for e in range(m):
-        u = sources[e]; v = targets[e]
-        deg[u] += 1; deg[v] += 1
-    indptr = np.zeros(n_nodes + 1, dtype=np.int32)
-    for i in range(n_nodes):
-        indptr[i+1] = indptr[i] + deg[i]
-
-    # Fill neighbors + weights
-    nbrs = np.empty(indptr[-1], dtype=np.int32)
-    wts  = np.empty(indptr[-1], dtype=np.float32)
-    fill = np.zeros(n_nodes, dtype=np.int32)
-    for e in range(m):
-        u = sources[e]; v = targets[e]; w = weights[e]
-        p = indptr[u] + fill[u]; nbrs[p] = v; wts[p] = w; fill[u] += 1
-        p = indptr[v] + fill[v]; nbrs[p] = u; wts[p] = w; fill[v] += 1
-
-    # Best neighbor per node (parallel, independent writes)
+                        weights: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, int]:
+    """Optimized mutual nearest neighbor coarsening."""
     best_neighbor = np.full(n_nodes, -1, dtype=np.int32)
-    for u in nb.prange(n_nodes):
-        start = indptr[u]; end = indptr[u+1]
-        bw = -np.inf; bn = -1
-        for p in range(start, end):
-            w = wts[p]; v = nbrs[p]
-            if w > bw:
-                bw = w; bn = v
-        best_neighbor[u] = bn
-
-    # Assign meta IDs (sequential, deterministic)
+    best_weight = np.full(n_nodes, -np.inf, dtype=np.float32)
+    
+    # Find best neighbors in parallel
+    for i in prange(len(sources)):
+        u, v, w = sources[i], targets[i], weights[i]
+        
+        if w > best_weight[u]:
+            best_weight[u] = w
+            best_neighbor[u] = v
+            
+        if w > best_weight[v]:
+            best_weight[v] = w
+            best_neighbor[v] = u
+    
+    # Assign meta IDs (sequential for correctness)
     meta_id = np.full(n_nodes, -1, dtype=np.int32)
     next_meta = 0
+    
+    # Mutual pairs
     for i in range(n_nodes):
         j = best_neighbor[i]
-        if j >= 0 and j > i and best_neighbor[j] == i and meta_id[i] == -1:
-            meta_id[i] = next_meta; meta_id[j] = next_meta; next_meta += 1
+        if j > i and j >= 0 and best_neighbor[j] == i and meta_id[i] == -1:
+            meta_id[i] = meta_id[j] = next_meta
+            next_meta += 1
+    
+    # Singletons
     for i in range(n_nodes):
         if meta_id[i] == -1:
-            meta_id[i] = next_meta; next_meta += 1
+            meta_id[i] = next_meta
+            next_meta += 1
+    
     return meta_id, next_meta
 
 @nb.njit(cache=True)
@@ -300,33 +293,38 @@ def aggregate_edges_with_distances(src: np.ndarray, tgt: np.ndarray,
     
     return out_src, out_tgt, out_w, out_dist
 
-from numba import atomic
-
-@nb.njit(cache=True, parallel=True)
+@nb.njit(parallel=True)
 def _accumulate_stats(sources, targets, distances, sims, cidx, n_clusters):
+    """Accumulate community statistics in parallel."""
     vol = np.zeros(n_clusters, dtype=np.float64)
     cut = np.zeros(n_clusters, dtype=np.float64)
     int_cnt = np.zeros(n_clusters, dtype=np.int64)
     ext_cnt = np.zeros(n_clusters, dtype=np.int64)
     sum_d = np.zeros(n_clusters, dtype=np.float64)
     sumsq_d = np.zeros(n_clusters, dtype=np.float64)
-
-    for e in nb.prange(sources.shape[0]):
-        u = sources[e]; v = targets[e]
-        du = cidx[u]; dv = cidx[v]
-        w = sims[e]; d = distances[e]
-
-        atomic.add(vol, du, w); atomic.add(vol, dv, w)
+    
+    for e in prange(sources.shape[0]):
+        u = sources[e]
+        v = targets[e]
+        du = cidx[u]
+        dv = cidx[v]
+        w = sims[e]
+        d = distances[e]
+        
+        vol[du] += w
+        vol[dv] += w
+        
         if du == dv:
-            atomic.add(int_cnt, du, 1)
-            atomic.add(sum_d, du, d)
-            atomic.add(sumsq_d, du, d * d)
+            int_cnt[du] += 1
+            sum_d[du] += d
+            sumsq_d[du] += d * d
         else:
-            atomic.add(cut, du, w); atomic.add(cut, dv, w)
-            atomic.add(ext_cnt, du, 1); atomic.add(ext_cnt, dv, 1)
+            cut[du] += w
+            cut[dv] += w
+            ext_cnt[du] += 1
+            ext_cnt[dv] += 1
+    
     return vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d
-
-
 
 @nb.njit(parallel=True, cache=True)
 def detect_interface_edges(sources: np.ndarray, targets: np.ndarray, 
@@ -396,71 +394,97 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
     return (is_interface, edge_types, source_clusters, target_clusters, 
             interface_count, cross_count, pruned_count)
 
-@nb.njit(cache=True)
+@nb.njit(parallel=True, cache=True)
 def sparsify_knn_fast(sources: np.ndarray, targets: np.ndarray, 
-                      weights: np.ndarray, n_nodes: int, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    # Count deg
+                     weights: np.ndarray, n_nodes: int, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fast k-NN sparsification using parallel sorting."""
+    # Count edges per node
     degrees = np.zeros(n_nodes, dtype=np.int32)
-    for i in range(sources.shape[0]):
+    for i in range(len(sources)):
         degrees[sources[i]] += 1
-
-    # Offsets
+    
+    # Build offsets
     offsets = np.zeros(n_nodes + 1, dtype=np.int32)
     for i in range(n_nodes):
         offsets[i+1] = offsets[i] + degrees[i]
-
-    # Buckets
-    total = sources.shape[0]
-    edge_targets = np.empty(total, dtype=np.int32)
-    edge_weights = np.empty(total, dtype=np.float32)
-    edge_indices = np.empty(total, dtype=np.int32)
-
-    fill = np.zeros(n_nodes, dtype=np.int32)
-    for e in range(total):
-        u = sources[e]
-        pos = offsets[u] + fill[u]
+    
+    # Store edges per node
+    total_edges = len(sources)
+    edge_targets = np.empty(total_edges, dtype=np.int32)
+    edge_weights = np.empty(total_edges, dtype=np.float32)
+    edge_indices = np.empty(total_edges, dtype=np.int32)
+    
+    # Reset degrees for filling
+    degrees.fill(0)
+    for e in range(total_edges):
+        src = sources[e]
+        pos = offsets[src] + degrees[src]
         edge_targets[pos] = targets[e]
         edge_weights[pos] = weights[e]
         edge_indices[pos] = e
-        fill[u] += 1
-
-    # Count kept edges
+        degrees[src] += 1
+    
+    # Count total edges to keep
     new_edge_count = 0
-    for u in range(n_nodes):
-        deg = offsets[u+1] - offsets[u]
+    for node in range(n_nodes):
+        deg = offsets[node+1] - offsets[node]
         if deg > 0:
             new_edge_count += min(k, deg)
-
+    
+    # Allocate output arrays
     sparse_sources = np.empty(new_edge_count, dtype=np.int32)
     sparse_targets = np.empty(new_edge_count, dtype=np.int32)
     sparse_weights = np.empty(new_edge_count, dtype=np.float32)
     sparse_orig_idx = np.empty(new_edge_count, dtype=np.int32)
-
+    
+    # Fill output arrays
     out = 0
-    for u in range(n_nodes):
-        start = offsets[u]; end = offsets[u+1]
+    for node in range(n_nodes):
+        start = offsets[node]
+        end = offsets[node+1]
         deg = end - start
+        
         if deg == 0:
             continue
+            
+        # Get edges for this node
+        wts = edge_weights[start:end]
+        idx = edge_indices[start:end]
+        
         if deg <= k:
+            # Keep all edges
             for j in range(deg):
-                sparse_sources[out] = u
+                sparse_sources[out] = node
                 sparse_targets[out] = edge_targets[start + j]
-                sparse_weights[out] = edge_weights[start + j]
-                sparse_orig_idx[out] = edge_indices[start + j]
+                sparse_weights[out] = wts[j]
+                sparse_orig_idx[out] = idx[j]
                 out += 1
         else:
-            # indices of top-k weights
-            idx_top = np.argpartition(edge_weights[start:end], deg - k)[deg - k:]  # length k
+            # Keep top k edges
+            temp_w = wts.copy()
+            best_j = np.empty(k, dtype=np.int32)
+            
+            # Find top k
             for j in range(k):
-                i0 = idx_top[j]
-                sparse_sources[out] = u
+                max_i = 0
+                max_w = temp_w[0]
+                for l in range(1, deg):
+                    if temp_w[l] > max_w:
+                        max_i = l
+                        max_w = temp_w[l]
+                best_j[j] = max_i
+                temp_w[max_i] = -np.inf
+            
+            # Store top k
+            for j in range(k):
+                i0 = best_j[j]
+                sparse_sources[out] = node
                 sparse_targets[out] = edge_targets[start + i0]
-                sparse_weights[out] = edge_weights[start + i0]
-                sparse_orig_idx[out] = edge_indices[start + i0]
+                sparse_weights[out] = wts[i0]
+                sparse_orig_idx[out] = idx[i0]
                 out += 1
+    
     return sparse_sources, sparse_targets, sparse_weights, sparse_orig_idx
-
 
 @njit(parallel=True, cache=True)
 def _sparsify_csr_data(indptr: np.ndarray, data: np.ndarray, k: int):
@@ -557,13 +581,12 @@ class OptimizedGraphLoader:
                 self.csr_indices = data["indices"].astype(np.int32)
         else:
             with perf_monitor.timed_operation("Build+cache CSR"):
-                adj = self.adjacency
-                if not sp.isspmatrix_csr(adj):
-                    adj = adj.tocsr()
-                self.csr_offsets = adj.indptr.astype(np.int32, copy=False)
-                self.csr_indices = adj.indices.astype(np.int32, copy=False)
-                np.savez_compressed(csr_cache, offsets=self.csr_offsets, indices=self.csr_indices)
-
+                adj = self.adjacency.tocsr()
+                self.csr_offsets = adj.indptr.astype(np.int32)
+                self.csr_indices = adj.indices.astype(np.int32)
+                np.savez_compressed(csr_cache,
+                                    offsets=self.csr_offsets,
+                                    indices=self.csr_indices)
         
     @property
     def metadata(self) -> Dict:
@@ -1006,49 +1029,6 @@ class OptimizedCommunityAnalyzer:
         else:
             self.sparsify_post_k = int(self.previous_sparsify_post_k * self.coarsening_ratio)
         self._apply_post_coarsened_sparsification()
-    
-    def _project_labels_to_coarse_mode(self, fine_labels: np.ndarray) -> np.ndarray:
-        """
-        Project fine-level labels (size = |V|) to the current coarse graph (size = |V'|)
-        by taking the mode (majority label) over each meta-node's members.
-
-        - Deterministic: ties break toward the smallest label (via np.unique sorting).
-        - If the graph is not coarsened, returns a copy of the input.
-        """
-        if not self.coarsened or self.meta_id is None:
-            return fine_labels.copy()
-
-        if fine_labels.shape[0] != self.loader.n_nodes:
-            raise ValueError(
-                f"fine_labels has length {fine_labels.shape[0]}, "
-                f"but loader.n_nodes is {self.loader.n_nodes}."
-            )
-
-        n_meta = int(self.n_nodes_final)
-        coarse = np.empty(n_meta, dtype=np.int32)
-
-        # Group once by meta_id (sorted), then take a mode per group.
-        order = np.argsort(self.meta_id)
-        meta_sorted = self.meta_id[order]
-        labels_sorted = fine_labels[order]
-
-        # Boundaries where meta id changes, with sentinels at ends.
-        boundaries = np.flatnonzero(
-            np.concatenate((
-                np.array([True]),
-                meta_sorted[1:] != meta_sorted[:-1],
-                np.array([True])
-            ))
-        )
-
-        for g in range(boundaries.shape[0] - 1):
-            start = boundaries[g]
-            end = boundaries[g + 1]
-            vals, counts = np.unique(labels_sorted[start:end], return_counts=True)
-            # np.unique sorts vals ascending; argmax picks first max → deterministic tie-break
-            coarse[meta_sorted[start]] = np.int32(vals[np.argmax(counts)])
-
-        return coarse
 
     def _create_igraph(self):
         """Create igraph from current graph data."""
@@ -1076,97 +1056,105 @@ class OptimizedCommunityAnalyzer:
                 print("  Created igraph using list approach")
     
     def run_leiden_igraph(self, resolution: float, run_id: str = None, 
-                      scale: Union[float, str] = 'adaptive',
-                      initial_membership: Optional[np.ndarray] = None,
-                      rank_stat_col: Optional[str] = None,
-                      prune_small_clusters: bool = False,
-                      min_cluster_size: Optional[int] = None,
-                      knee_sensitivity: float = 1.0,
-                      normalize_rank_stat: bool = True,
-                      reassign_pruned: bool = False,
-                      output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
-        """Run Leiden with optional warm start (Louvain cold-start fallback)."""
+                         scale: Union[float, str] = 'adaptive',
+                         initial_membership: Optional[np.ndarray] = None,
+                         rank_stat_col: Optional[str] = None,
+                         prune_small_clusters: bool = False,
+                         min_cluster_size: Optional[int] = None,
+                         knee_sensitivity: float = 1.0,
+                         normalize_rank_stat: bool = True,
+                         reassign_pruned: bool = False,
+                         output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
+        """Run Leiden with Louvain cold-start."""
         import igraph as ig
         import leidenalg
-
-        # Ensure graph is prepared and exists
+        
+        # Ensure graph is prepared
         self._ensure_prepared()
+        
+        # Create igraph if not already created
         if not hasattr(self, 'igraph'):
             self._create_igraph()
-
-        # Run / output naming
+    
+        # Generate run_id and output prefix
         if run_id is None:
             run_id = f"leiden_res{resolution:.3f}"
         if output_prefix is None:
             output_prefix = f"leiden_{run_id}_"
-
+    
         if self.verbose:
             print(f"\n--- Running Leiden with resolution={resolution} ---")
-
+    
         with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
-            # Always set the weights for the *current* graph (fine or coarsened)
-            sims = self._compute_similarities(self.distances, scale)
-            self.igraph.es['weight'] = sims.tolist()
-
-            # Prepare warm start:
-            # - If provided at fine-level and we are coarsened, project via mode.
-            # - If provided at coarse-level, length must match current graph.
-            # - If not provided, use Louvain memberships as a cold start.
-            if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != self.n_nodes_final:
-                    raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, "
-                        f"expected {self.loader.n_nodes} (fine) or {self.n_nodes_final} (coarse)."
-                    )
-            else:
+            # Cold-start with Louvain if no initial membership
+            if initial_membership is None:
                 if self.verbose:
                     print("  Cold-start Louvain…")
                 louvain_part = self.igraph.community_multilevel(weights=self.igraph.es['weight'])
                 initial_membership = np.array(louvain_part.membership, dtype=np.int32)
-
-            # Leiden with warm-start
+                leiden_iters = 5
+            else:
+                leiden_iters = 5
+    
+            # Set edge weights
+            if not self.coarsened:
+                sims = self._compute_similarities(self.distances, scale)
+                self.igraph.es['weight'] = sims.tolist()
+    
+            # Handle warm-start projection
+            if self.coarsened and initial_membership is not None \
+               and initial_membership.shape[0] == self.loader.n_nodes:
+                coarse_init = np.zeros(self.n_nodes_final, dtype=np.int32)
+                for i in range(self.loader.n_nodes):
+                    coarse_init[self.meta_id[i]] = initial_membership[i]
+                initial_membership = coarse_init
+    
+            # Run Leiden
+            partition_kwargs = {
+                'resolution_parameter': float(resolution),
+                'weights': 'weight',
+                'n_iterations': leiden_iters
+            }
+            if initial_membership is not None:
+                partition_kwargs['initial_membership'] = initial_membership.tolist()
+    
             partition = leidenalg.find_partition(
                 self.igraph,
                 leidenalg.RBConfigurationVertexPartition,
-                resolution_parameter=float(resolution),
-                weights='weight',
-                n_iterations=5,
-                initial_membership=initial_membership.tolist()
+                **partition_kwargs
             )
             labels = np.array(partition.membership, dtype=np.int32)
-
-            # If we ran on a coarsened graph, project labels back to fine level
+    
+            # Project labels back if coarsened
             if self.coarsened:
                 full_labels = np.zeros(self.loader.n_nodes, dtype=np.int32)
                 for i in range(self.loader.n_nodes):
                     full_labels[i] = labels[self.meta_id[i]]
                 labels = full_labels
-
+    
             if self.verbose:
                 n_clusters = len(np.unique(labels))
                 print(f"Found {n_clusters} communities")
-
+    
         # Process results
         with perf_monitor.timed_operation("Process cluster labels"):
             df = self.loader.node_df.copy()
             cluster_col = f'{output_prefix}cluster'
             rank_col = f'{output_prefix}rank'
             df[cluster_col] = labels
-
+    
         with perf_monitor.timed_operation("Process cluster statistics"):
             cluster_stats, pruning_info = self._process_cluster_stats(
                 df, labels, cluster_col, rank_col, rank_stat_col,
                 normalize_rank_stat, prune_small_clusters,
                 min_cluster_size, knee_sensitivity, reassign_pruned
             )
-
+    
         with perf_monitor.timed_operation("Identify interface edges"):
             interface_edges_df = self._identify_interface_edges(
                 df, cluster_col, pruning_info.get('pruned_clusters', []), scale
             )
-
+    
         with perf_monitor.timed_operation("Store run results"):
             self.runs[run_id] = {
                 'df': df,
@@ -1181,9 +1169,8 @@ class OptimizedCommunityAnalyzer:
                 'coarsening_ratio': self.coarsening_ratio if self.coarsened else None
             }
             self.interface_edges[run_id] = interface_edges_df
-
+    
         return cluster_stats, labels
-
 
     def run_louvain_csr(self, resolution: float, run_id: str = None,
                        scale: Union[float, str] = 'adaptive',
@@ -1229,14 +1216,12 @@ class OptimizedCommunityAnalyzer:
             )
             
             # Handle warm-start if provided
-            if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != self.n_nodes_final:
-                    raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, "
-                        f"expected {self.loader.n_nodes} (fine) or {self.n_nodes_final} (coarse)."
-                    )
+            if initial_membership is not None and self.coarsened \
+               and initial_membership.shape[0] == self.loader.n_nodes:
+                coarse_init = np.zeros(self.n_nodes_final, dtype=np.int32)
+                for i in range(self.loader.n_nodes):
+                    coarse_init[self.meta_id[i]] = initial_membership[i]
+                initial_membership = coarse_init
             
             # Run Louvain
             louvain = Louvain(
@@ -1354,14 +1339,12 @@ class OptimizedCommunityAnalyzer:
             )
             
             # Handle warm-start if provided
-            if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != self.n_nodes_final:
-                    raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, "
-                        f"expected {self.loader.n_nodes} (fine) or {self.n_nodes_final} (coarse)."
-                    )
+            if initial_membership is not None and self.coarsened \
+               and initial_membership.shape[0] == self.loader.n_nodes:
+                coarse_init = np.zeros(self.n_nodes_final, dtype=np.int32)
+                for i in range(self.loader.n_nodes):
+                    coarse_init[self.meta_id[i]] = initial_membership[i]
+                initial_membership = coarse_init
             
             # Run Leiden
             leiden = Leiden(
@@ -1721,64 +1704,85 @@ class OptimizedCommunityAnalyzer:
             return {'count': 0}
     
     def get_combined_edge_data(self, run_ids=None) -> pd.DataFrame:
+        """Combine interface edges from multiple runs."""
         if run_ids is None:
             run_ids = list(self.runs.keys())
+            
         if not run_ids:
             raise ValueError("No runs available to combine")
-
+        
         with perf_monitor.timed_operation("Combine edge data"):
-            # edge -> first index map on full graph (canonicalized)
-            full_map = {}
-            for idx in range(self.full_sources.shape[0]):
-                s = int(self.full_sources[idx]); t = int(self.full_targets[idx])
-                if s == t:
-                    continue
-                key = (s, t) if s < t else (t, s)
-                if key not in full_map:
-                    full_map[key] = idx
-
-            # union of all interface edges
+            # Get all unique edges
             all_edges = set()
-            per_run_type = {rid: {} for rid in run_ids}
-            for rid in run_ids:
-                if rid not in self.interface_edges:
+            for run_id in run_ids:
+                if run_id not in self.interface_edges:
                     continue
-                df = self.interface_edges[rid]
-                for i in range(len(df)):
-                    a = int(df.iloc[i]['source']); b = int(df.iloc[i]['target'])
-                    key = (a, b) if a < b else (b, a)
-                    all_edges.add(key)
-                    per_run_type[rid][key] = df.iloc[i]['edge_type']
-
-            combined = []
-            for key in all_edges:
-                idx = full_map.get(key, -1)
-                if idx < 0:
+                    
+                edges_df = self.interface_edges[run_id]
+                for _, row in edges_df.iterrows():
+                    source = min(row['source'], row['target'])
+                    target = max(row['source'], row['target'])
+                    all_edges.add((source, target))
+            
+            # Create edge type map
+            edge_types = {run_id: {} for run_id in run_ids}
+            for run_id in run_ids:
+                if run_id not in self.interface_edges:
                     continue
-                row = {
-                    'source': key[0],
-                    'target': key[1],
-                    'distance': float(self.full_distances[idx])
+                    
+                edges_df = self.interface_edges[run_id]
+                for _, row in edges_df.iterrows():
+                    source = min(row['source'], row['target'])
+                    target = max(row['source'], row['target'])
+                    edge_types[run_id][(source, target)] = row['edge_type']
+            
+            # Build combined dataframe
+            combined_data = []
+            for source, target in all_edges:
+                # Get edge properties
+                edge_idx = None
+                for idx, (s, t) in enumerate(zip(self.full_sources, self.full_targets)):
+                    if (min(s, t), max(s, t)) == (source, target):
+                        edge_idx = idx
+                        break
+                        
+                if edge_idx is None:
+                    continue
+                    
+                # Basic edge data
+                edge_data = {
+                    'source': source,
+                    'target': target,
+                    'distance': float(self.full_distances[edge_idx])
                 }
-                in_any = False
-                for rid in run_ids:
-                    present = key in per_run_type[rid]
-                    row[f'in_{rid}'] = present
-                    row[f'type_{rid}'] = per_run_type[rid].get(key, 'not_interface')
-                    if present:
-                        in_any = True
-                if in_any:
-                    row['run_count'] = sum(1 for rid in run_ids if row[f'in_{rid}'])
-                    combined.append(row)
-            self.combined_edges = pd.DataFrame(combined)
-
+                
+                # Add data for each run
+                in_any_run = False
+                for run_id in run_ids:
+                    if run_id in edge_types and (source, target) in edge_types[run_id]:
+                        edge_data[f'in_{run_id}'] = True
+                        edge_data[f'type_{run_id}'] = edge_types[run_id][(source, target)]
+                        in_any_run = True
+                    else:
+                        edge_data[f'in_{run_id}'] = False
+                        edge_data[f'type_{run_id}'] = 'not_interface'
+                
+                if in_any_run:
+                    # Count runs
+                    edge_data['run_count'] = sum(1 for run_id in run_ids 
+                                               if f'in_{run_id}' in edge_data and edge_data[f'in_{run_id}'])
+                    combined_data.append(edge_data)
+            
+            # Create dataframe
+            self.combined_edges = pd.DataFrame(combined_data)
+            
             if self.verbose and len(self.combined_edges) > 0:
-                vc = self.combined_edges['run_count'].value_counts().sort_index()
+                run_count_stats = self.combined_edges['run_count'].value_counts().sort_index()
                 print("Edge counts by number of runs:")
-                for k, v in vc.items():
-                    print(f"  - In {k}/{len(run_ids)} runs: {v} edges")
+                for count, freq in run_count_stats.items():
+                    print(f"  - In {count}/{len(run_ids)} runs: {freq} edges")
+                    
             return self.combined_edges
-
     
     def add_community_statistics(self, run_id, recalculate=False) -> pd.DataFrame:
         """Calculate community statistics using Numba acceleration."""
@@ -2328,7 +2332,6 @@ def main(location, output_dir, run_name, resolutions, similarity_scale,
          min_cluster_size, rank_stat_col, timing, algorithm):
     """Optimized community detection pipeline."""
     # Configure performance monitoring
-    np.random.seed(42)
     global perf_monitor
     perf_monitor.enabled = timing
     perf_monitor.reset()
