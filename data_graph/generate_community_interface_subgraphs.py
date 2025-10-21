@@ -106,6 +106,15 @@ perf_monitor = PerformanceMonitor(enabled=True)
 # ============================================================================
 # NUMBA OPTIMIZED FUNCTIONS
 # ============================================================================
+@nb.njit(parallel=True, cache=True)
+def _mask_upper_cross_labels(s: np.ndarray, t: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    n = s.size
+    m = np.zeros(n, dtype=np.uint8)
+    for i in nb.prange(n):
+        u = s[i]; v = t[i]
+        if u < v and labels[u] != labels[v]:
+            m[i] = 1
+    return m
 
 @nb.njit(parallel=True, fastmath=True, cache=True)
 def build_csr_graph(sources: np.ndarray, targets: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -149,28 +158,31 @@ def make_edge_flat(sources: np.ndarray, targets: np.ndarray) -> np.ndarray:
         out[2*i+1] = targets[i]
     return out
 
-@nb.njit(cache=True, parallel=True)
-def mutual_nn_coarsening(sources: np.ndarray, targets: np.ndarray, 
-                         weights: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, int]:
-    # Build deg / indptr
+@nb.njit(cache=True, parallel=False)
+def mutual_nn_coarsening(sources, targets, weights, n_nodes):
     deg = np.zeros(n_nodes, dtype=np.int32)
     m = sources.shape[0]
     for e in range(m):
         u = sources[e]; v = targets[e]
+        if u >= v:  # process undirected edge once
+            continue
         deg[u] += 1; deg[v] += 1
+
     indptr = np.zeros(n_nodes + 1, dtype=np.int32)
     for i in range(n_nodes):
         indptr[i+1] = indptr[i] + deg[i]
 
-    # Fill neighbors + weights
     nbrs = np.empty(indptr[-1], dtype=np.int32)
     wts  = np.empty(indptr[-1], dtype=np.float32)
     fill = np.zeros(n_nodes, dtype=np.int32)
+
     for e in range(m):
         u = sources[e]; v = targets[e]; w = weights[e]
+        if u >= v:
+            continue
         p = indptr[u] + fill[u]; nbrs[p] = v; wts[p] = w; fill[u] += 1
         p = indptr[v] + fill[v]; nbrs[p] = u; wts[p] = w; fill[v] += 1
-
+    
     # Best neighbor per node (parallel, independent writes)
     best_neighbor = np.full(n_nodes, -1, dtype=np.int32)
     for u in nb.prange(n_nodes):
@@ -196,18 +208,16 @@ def mutual_nn_coarsening(sources: np.ndarray, targets: np.ndarray,
 
 @nb.njit(cache=True)
 def aggregate_edges(src: np.ndarray, tgt: np.ndarray, w: np.ndarray):
-    """Aggregate duplicate edges efficiently."""
     n = src.shape[0]
-    
-    # Build 64-bit keys for sorting
+    if n == 0:
+        return (np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32))
+
     keys = np.empty(n, dtype=np.int64)
     for i in range(n):
         keys[i] = (np.int64(src[i]) << 32) | np.int64(tgt[i])
-    
-    # Sort by key
+
     order = np.argsort(keys)
-    
-    # Count unique keys
+
     unique_count = 0
     prev = np.int64(-1)
     for idx in order:
@@ -215,13 +225,11 @@ def aggregate_edges(src: np.ndarray, tgt: np.ndarray, w: np.ndarray):
         if k != prev:
             unique_count += 1
             prev = k
-    
-    # Allocate output
+
     out_src = np.empty(unique_count, dtype=np.int32)
     out_tgt = np.empty(unique_count, dtype=np.int32)
     out_w   = np.empty(unique_count, dtype=np.float32)
-    
-    # Accumulate weights
+
     out_i = 0
     prev = np.int64(-1)
     acc  = 0.0
@@ -237,12 +245,10 @@ def aggregate_edges(src: np.ndarray, tgt: np.ndarray, w: np.ndarray):
                 out_i += 1
             prev = k
             acc  = w[pos]
-    
-    # Flush last group
+
     out_src[out_i] = np.int32(prev >> 32)
     out_tgt[out_i] = np.int32(prev & 0xFFFFFFFF)
     out_w[out_i]   = acc
-    
     return out_src, out_tgt, out_w
 
 @nb.njit(cache=True)
@@ -304,29 +310,37 @@ from numba import atomic
 
 @nb.njit(cache=True, parallel=True)
 def _accumulate_stats(sources, targets, distances, sims, cidx, n_clusters):
-    vol = np.zeros(n_clusters, dtype=np.float64)
-    cut = np.zeros(n_clusters, dtype=np.float64)
-    int_cnt = np.zeros(n_clusters, dtype=np.int64)
-    ext_cnt = np.zeros(n_clusters, dtype=np.int64)
-    sum_d = np.zeros(n_clusters, dtype=np.float64)
-    sumsq_d = np.zeros(n_clusters, dtype=np.float64)
+    vol    = np.zeros(n_clusters, dtype=np.float64)
+    cut    = np.zeros(n_clusters, dtype=np.float64)
+    int_cnt= np.zeros(n_clusters, dtype=np.int64)
+    ext_cnt= np.zeros(n_clusters, dtype=np.int64)
+    sum_d  = np.zeros(n_clusters, dtype=np.float64)
+    sumsq_d= np.zeros(n_clusters, dtype=np.float64)
 
     for e in nb.prange(sources.shape[0]):
         u = sources[e]; v = targets[e]
-        du = cidx[u]; dv = cidx[v]
-        w = sims[e]; d = distances[e]
+        if u >= v:      # keep only one orientation of an undirected edge
+            continue
 
-        atomic.add(vol, du, w); atomic.add(vol, dv, w)
+        du = cidx[u]; dv = cidx[v]
+        w64 = np.float64(sims[e])
+        d64 = np.float64(distances[e])
+
+        # volume: add each endpoint once (since we only see the edge once)
+        atomic.add(vol, du, w64)
+        atomic.add(vol, dv, w64)
+
         if du == dv:
             atomic.add(int_cnt, du, 1)
-            atomic.add(sum_d, du, d)
-            atomic.add(sumsq_d, du, d * d)
+            atomic.add(sum_d, du, d64)
+            atomic.add(sumsq_d, du, d64 * d64)
         else:
-            atomic.add(cut, du, w); atomic.add(cut, dv, w)
-            atomic.add(ext_cnt, du, 1); atomic.add(ext_cnt, dv, 1)
+            atomic.add(cut, du, w64)
+            atomic.add(cut, dv, w64)
+            atomic.add(ext_cnt, du, 1)
+            atomic.add(ext_cnt, dv, 1)
+
     return vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d
-
-
 
 @nb.njit(parallel=True, cache=True)
 def detect_interface_edges(sources: np.ndarray, targets: np.ndarray, 
@@ -349,7 +363,7 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
     n_edges = len(sources)
     
     # Pre-allocate result arrays
-    is_interface = np.zeros(n_edges, dtype=nb.boolean)
+    is_interface = np.zeros(n_edges, dtype=np.bool_)
     edge_types = np.zeros(n_edges, dtype=nb.int8)
     source_clusters = np.zeros(n_edges, dtype=np.int32)
     target_clusters = np.zeros(n_edges, dtype=np.int32)
@@ -360,7 +374,7 @@ def identify_interface_edges_detailed(sources: np.ndarray, targets: np.ndarray,
         if c > max_cluster:
             max_cluster = c
     
-    is_pruned = np.zeros(max_cluster + 1, dtype=nb.boolean)
+    is_pruned = np.zeros(max_cluster + 1, dtype=np.bool_)
     for c in pruned_clusters:
         is_pruned[c] = True
     
@@ -460,24 +474,6 @@ def sparsify_knn_fast(sources: np.ndarray, targets: np.ndarray,
                 sparse_orig_idx[out] = edge_indices[start + i0]
                 out += 1
     return sparse_sources, sparse_targets, sparse_weights, sparse_orig_idx
-
-
-@njit(parallel=True, cache=True)
-def _sparsify_csr_data(indptr: np.ndarray, data: np.ndarray, k: int):
-    """In-place zeroing of all but the top-k values in each CSR row."""
-    n_rows = indptr.shape[0] - 1
-    for i in prange(n_rows):
-        start = indptr[i]
-        end   = indptr[i + 1]
-        length = end - start
-        if length > k:
-            # Find the (length - k)th smallest pivot
-            row = data[start:end]
-            pivot = np.partition(row, length - k)[length - k]
-            # Zero out any entry below pivot
-            for idx in range(start, end):
-                if data[idx] < pivot:
-                    data[idx] = 0.0
 
 @nb.njit(fastmath=True, cache=True)
 def find_knee_point(x: np.ndarray, y: np.ndarray, S: float = 1.0, 
@@ -709,6 +705,8 @@ class OptimizedGraphLoader:
 # ============================================================================
 # OPTIMIZED COMMUNITY ANALYZER
 # ============================================================================
+def _fmt_res(x: float) -> str:
+    return f"{x:.6g}"
 
 class OptimizedCommunityAnalyzer:
     """Optimized community detection with minimal memory footprint."""
@@ -883,17 +881,16 @@ class OptimizedCommunityAnalyzer:
             if self.verbose:
                 print(f"  Sparsified to {len(new_src):,} edges")
 
-    def _gaussian_similarity(self, distances: np.ndarray, scale: Union[float, str] = 'adaptive') -> np.ndarray:
-        """Gaussian similarity with adaptive scaling."""
-        if isinstance(scale, str) and scale == 'adaptive':
-            # Cache median for performance
-            if len(self._median_cache) == 0:
-                self._median_cache['global'] = float(np.median(self.distances))
-            scale = self._median_cache['global']
-        elif scale is None:
-            scale = float(np.median(distances))
-        
-        return np.exp(-(distances/scale)**2/2).astype(np.float32)
+    def _gaussian_similarity(self, distances, scale='adaptive'):
+        if scale == 'adaptive' or scale is None:
+            scale_val = float(np.median(distances)) if distances.size else 1.0
+        else:
+            scale_val = float(scale)
+        if not np.isfinite(scale_val) or scale_val <= 0.0:
+            scale_val = 1e-12  # epsilon
+        return np.exp(-(distances/scale_val)**2/2).astype(np.float32)
+
+
         
     def _compute_similarities(self, distances: np.ndarray, scale: Union[float, str] = 'adaptive') -> np.ndarray:
         """Compute similarities with caching."""
@@ -1002,9 +999,9 @@ class OptimizedCommunityAnalyzer:
         # Apply post-coarsening sparsification
         self.previous_sparsify_post_k = self.sparsify_post_k
         if self.previous_sparsify_post_k is None:
-            self.sparsify_post_k = int(self.sparsify_pre_k * self.coarsening_ratio)
+            self.sparsify_post_k = max(1, int(self.sparsify_pre_k * self.coarsening_ratio))
         else:
-            self.sparsify_post_k = int(self.previous_sparsify_post_k * self.coarsening_ratio)
+            self.sparsify_post_k = max(1, int(self.previous_sparsify_post_k * self.coarsening_ratio))
         self._apply_post_coarsened_sparsification()
     
     def _project_labels_to_coarse_mode(self, fine_labels: np.ndarray) -> np.ndarray:
@@ -1096,14 +1093,14 @@ class OptimizedCommunityAnalyzer:
 
         # Run / output naming
         if run_id is None:
-            run_id = f"leiden_res{resolution:.3f}"
+            run_id = f"leiden_res{_fmt_res(resolution)}"
         if output_prefix is None:
             output_prefix = f"leiden_{run_id}_"
 
         if self.verbose:
-            print(f"\n--- Running Leiden with resolution={resolution} ---")
+            print(f"\n--- Running Leiden with resolution={_fmt_res(resolution)} ---")
 
-        with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
+        with perf_monitor.timed_operation(f"Leiden clustering (res={_fmt_res(resolution)})"):
             # Always set the weights for the *current* graph (fine or coarsened)
             sims = self._compute_similarities(self.distances, scale)
             self.igraph.es['weight'] = sims.tolist()
@@ -1164,7 +1161,7 @@ class OptimizedCommunityAnalyzer:
 
         with perf_monitor.timed_operation("Identify interface edges"):
             interface_edges_df = self._identify_interface_edges(
-                df, cluster_col, pruning_info.get('pruned_clusters', []), scale
+                df, cluster_col, pruning_info.get('pruned_clusters', []), scale, include_similarity=False
             )
 
         with perf_monitor.timed_operation("Store run results"):
@@ -1577,148 +1574,121 @@ class OptimizedCommunityAnalyzer:
         return pruning_info
     
     def _reassign_pruned_nodes(self, df, cluster_col, pruned_clusters, kept_clusters):
-        """Reassign nodes from pruned clusters to nearest large cluster."""
         if self.verbose:
-            print(f"Reassigning nodes from pruned clusters...")
-        
-        # Identify nodes in pruned clusters
-        pruned_mask = df[cluster_col].isin(pruned_clusters)
-        pruned_indices = np.where(pruned_mask)[0]
-        
-        if len(pruned_indices) == 0:
-            return
-            
-        # Mark pruned nodes
+            print("Reassigning nodes from pruned clusters...")
+
+        col_idx = df.columns.get_loc(cluster_col)
+        node_to_cluster = df[cluster_col].to_numpy(copy=True)
+
         temp_label = -1
-        df.loc[pruned_mask, cluster_col] = temp_label
-        
-        # Create lookup array
-        n_nodes = len(df)
-        node_to_cluster = np.array(df[cluster_col].values)
-        
-        # Reassign each pruned node
-        reassigned_count = 0
-        
+        pruned_mask = np.isin(node_to_cluster, np.array(pruned_clusters, dtype=node_to_cluster.dtype))
+        pruned_indices = np.flatnonzero(pruned_mask)
+
+        node_to_cluster[pruned_indices] = temp_label
+
+        reassigned = 0
         for node_idx in pruned_indices:
-            # Get neighbors
-            start = self.csr_offsets[node_idx]
-            end = self.csr_offsets[node_idx + 1]
-            neighbors = self.csr_indices[start:end]
-            
-            # Get neighbor clusters
-            neighbor_clusters = [
-                node_to_cluster[n] for n in neighbors 
-                if 0 <= n < n_nodes and node_to_cluster[n] != temp_label
-            ]
-            
-            if neighbor_clusters:
-                # Find most common cluster
-                cluster_counts = Counter(neighbor_clusters)
-                most_common_cluster = cluster_counts.most_common(1)[0][0]
-                
-                # Reassign
-                df.loc[node_idx, cluster_col] = most_common_cluster
-                node_to_cluster[node_idx] = most_common_cluster
-                reassigned_count += 1
-        
+            start = self.csr_offsets[node_idx]; end = self.csr_offsets[node_idx+1]
+            nbr = self.csr_indices[start:end]
+            nbr_cl = node_to_cluster[nbr]
+            nbr_cl = nbr_cl[nbr_cl != temp_label]
+            if nbr_cl.size:
+                # majority vote
+                vals, counts = np.unique(nbr_cl, return_counts=True)
+                node_to_cluster[node_idx] = vals[np.argmax(counts)]
+                reassigned += 1
+
         if self.verbose:
-            print(f"Reassigned {reassigned_count} of {len(pruned_indices)} nodes from pruned clusters")
-            
-            # Check for unassigned nodes
-            still_pruned = (df[cluster_col] == temp_label).sum()
-            if still_pruned > 0:
-                print(f"Warning: {still_pruned} nodes could not be reassigned (no non-pruned neighbors)")
-                # Assign to largest cluster as fallback
-                largest_cluster = kept_clusters[0]
-                df.loc[df[cluster_col] == temp_label, cluster_col] = largest_cluster
+            print(f"Reassigned {reassigned} of {pruned_indices.size} nodes from pruned clusters")
+
+        # Fallback for any still -1
+        if np.any(node_to_cluster == temp_label):
+            node_to_cluster[node_to_cluster == temp_label] = kept_clusters[0]
+
+        # write-back once
+        df.iloc[:, col_idx] = node_to_cluster
+
     
-    def _identify_interface_edges(self, df, cluster_col, pruned_clusters, scale):
-        """Identify interface edges between communities."""
+    def _identify_interface_edges(self,
+                              df: pd.DataFrame,
+                              cluster_col: str,
+                              pruned_clusters,
+                              scale,
+                              include_similarity: bool = False) -> pd.DataFrame:
+        """
+        Identify interface edges between communities.
+
+        - Processes only one orientation (s < t).
+        - Builds a compact result directly (two-pass).
+        - Skips similarity computation unless include_similarity=True.
+        """
         if self.verbose:
-            print(f"Identifying interface edges...")
-        
-        # Get cluster assignments
-        clusters = df[cluster_col].values
-        
-        # Use full graph for interface detection
-        sources = self.full_sources
-        targets = self.full_targets
-        distances = self.full_distances
-        
-        # Calculate similarities
-        similarities = self._compute_similarities(distances, scale)
-        
-        # Convert pruned_clusters to array
-        pruned_clusters_array = np.array(list(pruned_clusters), dtype=np.int32)
-        
-        # Run interface detection
-        (is_interface, edge_types, source_clusters, target_clusters, 
-        interface_count, cross_count, pruned_count) = identify_interface_edges_detailed(
-            sources, targets, distances, similarities, 
-            clusters, pruned_clusters_array
-        )
-        
-        # Get indices of interface edges
-        interface_indices = np.where(is_interface)[0]
-        
-        if self.verbose:
-            print(f"Found {interface_count} interface edges:")
-            print(f"  - {cross_count} cross-community edges")
-            print(f"  - {pruned_count} edges in pruned communities")
-        
-        if len(interface_indices) > 0:
-            # Extract data for interface edges
-            interface_sources = sources[interface_indices]
-            interface_targets = targets[interface_indices]
-            interface_distances = distances[interface_indices]
-            interface_similarities = similarities[interface_indices]
-            interface_source_clusters = source_clusters[interface_indices]
-            interface_target_clusters = target_clusters[interface_indices]
-            interface_edge_types = edge_types[interface_indices]
-            
-            # Convert edge type codes
-            edge_type_map = {0: "cross_community", 1: "pruned_community"}
-            edge_type_strings = [edge_type_map[t] for t in interface_edge_types]
-            
-            # Create DataFrame
-            interface_edges_df = pd.DataFrame({
-                'source': interface_sources,
-                'target': interface_targets,
-                'distance': interface_distances,
-                'similarity': interface_similarities,
-                'source_cluster': interface_source_clusters,
-                'target_cluster': interface_target_clusters,
-                'edge_type': edge_type_strings
-            })
-        else:
-            # Empty DataFrame
-            interface_edges_df = pd.DataFrame(columns=[
-                'source', 'target', 'distance', 'similarity', 
+            print("Identifying interface edges...")
+
+        # Inputs
+        clusters = df[cluster_col].values.astype(np.int32, copy=False)
+        s_all = self.full_sources
+        t_all = self.full_targets
+        d_all = self.full_distances
+
+        # Pass 1: mask cross-community on upper triangle
+        mask = _mask_upper_cross_labels(s_all, t_all, clusters)
+        idx = np.flatnonzero(mask)  # compact indices
+
+        if idx.size == 0:
+            return pd.DataFrame(columns=[
+                'source', 'target', 'distance', 'similarity',
                 'source_cluster', 'target_cluster', 'edge_type'
             ])
-        
-        return interface_edges_df
-    
-    def extract_interface_edges(self, labels: np.ndarray) -> Dict[str, Any]:
-        """Extract interface edges efficiently."""
-        sources, targets, distances = self.loader.edge_arrays
-        
-        # Detect interfaces
-        is_interface = detect_interface_edges(sources, targets, labels)
-        interface_indices = np.where(is_interface)[0]
-        
-        # Extract interface data
-        if len(interface_indices) > 0:
-            return {
-                'sources': sources[interface_indices],
-                'targets': targets[interface_indices],
-                'distances': distances[interface_indices],
-                'source_clusters': labels[sources[interface_indices]],
-                'target_clusters': labels[targets[interface_indices]],
-                'count': len(interface_indices)
-            }
+
+        # Pass 2: gather compact arrays
+        s = s_all[idx]
+        t = t_all[idx]
+        d = d_all[idx]
+        sc = clusters[s]
+        tc = clusters[t]
+
+        # Only compute similarities if requested
+        if include_similarity:
+            sim = self._compute_similarities(d, scale).astype(np.float32, copy=False)
         else:
+            sim = np.zeros_like(d, dtype=np.float32)
+
+        # Edge types (cross vs pruned_community)
+        if pruned_clusters:
+            # vectorized, safe: use isin() on int arrays
+            pruned = np.array(list(pruned_clusters), dtype=np.int32)
+            is_pruned = np.isin(sc, pruned) | np.isin(tc, pruned)
+            edge_type = np.where(is_pruned, "pruned_community", "cross_community")
+            edge_type = pd.Categorical(edge_type, categories=["cross_community", "pruned_community"])
+        else:
+            edge_type = np.full(s.shape[0], "cross_community", dtype=object)
+            edge_type = pd.Categorical(edge_type, categories=["cross_community", "pruned_community"])
+
+        return pd.DataFrame({
+            'source': s.astype(np.int32, copy=False),
+            'target': t.astype(np.int32, copy=False),
+            'distance': d.astype(np.float32, copy=False),
+            'similarity': sim,  # zeros unless include_similarity=True
+            'source_cluster': sc.astype(np.int32, copy=False),
+            'target_cluster': tc.astype(np.int32, copy=False),
+            'edge_type': edge_type
+        })
+
+    def extract_interface_edges(self, labels: np.ndarray) -> Dict[str, Any]:
+        s, t, d = self.loader.edge_arrays
+        mask = _mask_upper_cross_labels(s, t, labels)
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
             return {'count': 0}
+        return {
+            'sources': s[idx],
+            'targets': t[idx],
+            'distances': d[idx],
+            'source_clusters': labels[s[idx]],
+            'target_clusters': labels[t[idx]],
+            'count': int(idx.size),
+        }
     
     def get_combined_edge_data(self, run_ids=None) -> pd.DataFrame:
         if run_ids is None:
@@ -1814,8 +1784,9 @@ class OptimizedCommunityAnalyzer:
             sims = self._compute_similarities(D, run_data.get('similarity_scale', 'adaptive'))
     
             # Accumulate stats using Numba
+            mask = S < T
             vol, cut, int_cnt, ext_cnt, sum_d, sumsq_d = _accumulate_stats(
-                S, T, D, sims, cluster_idx, n_clusters
+                S[mask], T[mask], D[mask], sims[mask], cluster_idx, n_clusters
             )
     
             # Post-process
@@ -2126,100 +2097,256 @@ class OptimizedCommunityAnalyzer:
             return graph_wrapper
 
 # ============================================================================
-# OUTPUT FUNCTIONS
+# OUTPUT FUNCTIONS (rewritten for speed + smaller I/O)
+#   - Write canonical (s,t) uint32 pairs + side arrays (no CSR build)
+#   - Deduplicate once via 64-bit key sort (optional)
+#   - Support legacy loader fallback
 # ============================================================================
 
-def save_interface_edges_efficient(interface_data: Dict[str, Any], 
-                                 output_file: str,
-                                 metadata: Dict[str, Any]):
-    """Save interface edges in efficient format."""
-    with perf_monitor.timed_operation("Save interface edges"):
-        if interface_data['count'] == 0:
-            # Save empty result
-            metadata['edge_count'] = 0
-            with open(output_file + '_metadata.json', 'w') as f:
-                json.dump(metadata, f, indent=2)
-            return
-        
-        # Create sparse matrix for edges
-        s = interface_data['sources']
-        t = interface_data['targets']
-        
-        # Canonical form
-        canonical_s = np.minimum(s, t)
-        canonical_t = np.maximum(s, t)
-        
-        n_nodes = metadata['n_nodes']
-        edge_matrix = sp.coo_matrix(
-            (np.ones(len(canonical_s), dtype=bool), (canonical_s, canonical_t)),
-            shape=(n_nodes, n_nodes)
-        ).tocsr()
-        
-        # Save sparse matrix
-        edge_file = output_file + '_edges.npz'
-        sp.save_npz(edge_file, edge_matrix)
-        
-        # Save attributes
-        attr_file = output_file + '_attributes.npz'
-        np.savez_compressed(
-            attr_file,
-            source_cluster=interface_data['source_clusters'].astype(np.int32),
-            target_cluster=interface_data['target_clusters'].astype(np.int32),
-            distance=interface_data['distances'].astype(np.float32)
-        )
-        
-        # Update and save metadata
-        metadata['edge_count'] = interface_data['count']
-        metadata['files'] = {
-            'edges': os.path.basename(edge_file),
-            'attributes': os.path.basename(attr_file)
-        }
-        
-        with open(output_file + '_metadata.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
+from typing import Dict, Any, Tuple, List
+import os, json
+import numpy as np
+import scipy.sparse as sp  # only used by legacy loader branch
 
-def load_interface_edges(output_dir, run_id):
-    """Load interface edges from optimized format."""
+
+def save_interface_edges_efficient(interface_data: Dict[str, Any],
+                                   output_file: str,
+                                   metadata: Dict[str, Any],
+                                   *,
+                                   dedup: bool = True,
+                                   compress: bool = False) -> None:
+    """
+    Save interface edges fast as canonical (s,t) pairs with side arrays.
+    - Avoids COO→CSR construction and deflate; much faster on large graphs.
+    - Keeps signature backward-compatible; extra args are keyword-only.
+
+    Parameters
+    ----------
+    interface_data : dict
+        Expect keys:
+          'sources' (int32), 'targets' (int32), 'distances' (float32),
+          'source_clusters' (int32), 'target_clusters' (int32), 'count' (int)
+    output_file : str
+        Base path (without suffix). Files written:
+          <output_file>_pairs.npz
+          <output_file>_metadata.json
+    metadata : dict
+        Must contain 'n_nodes'. Will be updated with 'edge_count' and 'files'.
+    dedup : bool, optional
+        If True (default), remove duplicate undirected edges after canonicalizing.
+    compress : bool, optional
+        If True, use np.savez_compressed (slower, smaller). Default False (faster).
+    """
+    with perf_monitor.timed_operation("Save interface edges"):
+        count = int(interface_data.get('count', 0))
+        if count == 0:
+            md = dict(metadata)
+            md['edge_count'] = 0
+            md['files'] = {'pairs': None}
+            with open(output_file + '_metadata.json', 'w') as f:
+                json.dump(md, f, indent=2)
+            return
+
+        # Required arrays
+        s = np.asarray(interface_data['sources'], dtype=np.uint32)
+        t = np.asarray(interface_data['targets'], dtype=np.uint32)
+        d = np.asarray(interface_data['distances'], dtype=np.float32)
+        sc = np.asarray(interface_data['source_clusters'], dtype=np.int32)
+        tc = np.asarray(interface_data['target_clusters'], dtype=np.int32)
+
+        # Canonicalize to undirected orientation: s <= t
+        s_c = np.minimum(s, t, dtype=np.uint32)
+        t_c = np.maximum(s, t, dtype=np.uint32)
+
+        # Optional dedup (stable mergesort to keep deterministic order)
+        if dedup and s_c.size:
+            keys = (s_c.astype(np.uint64) << 32) | t_c.astype(np.uint64)
+            order = np.argsort(keys, kind='mergesort')
+            ks = keys[order]
+            keep = np.empty(ks.size, dtype=bool)
+            keep[0] = True
+            if ks.size > 1:
+                keep[1:] = ks[1:] != ks[:-1]
+            idx = order[keep]
+            s_c, t_c = s_c[idx], t_c[idx]
+            d, sc, tc = d[idx], sc[idx], tc[idx]
+
+        # Persist quickly (no deflate by default)
+        out_pairs = output_file + '_pairs.npz'
+        saver = np.savez_compressed if compress else np.savez
+        saver(out_pairs, s=s_c, t=t_c, d=d, sc=sc, tc=tc)
+
+        # Update metadata
+        md = dict(metadata)
+        md['edge_count'] = int(s_c.size)
+        md['files'] = {'pairs': os.path.basename(out_pairs)}
+        with open(output_file + '_metadata.json', 'w') as f:
+            json.dump(md, f, indent=2)
+
+
+def load_interface_edges(output_dir: str, run_id: str) -> Tuple[List[Tuple[int, int]], Dict[str, np.ndarray], Dict[str, Any]]:
+    """
+    Load interface edges saved by `save_interface_edges_efficient`.
+    Backward compatible with the older CSR+attributes format.
+
+    Returns
+    -------
+    edge_list : list[tuple[int,int]]
+        Canonical undirected pairs (s, t) with s <= t
+    attributes : dict[str, np.ndarray]
+        Keys: 'source_cluster' ('sc'), 'target_cluster' ('tc'), 'distance' ('d')
+    metadata : dict
+        Metadata JSON for the run.
+    """
     with perf_monitor.timed_operation(f"Load interface edges for {run_id}"):
-        # Load metadata
-        metadata_file = os.path.join(output_dir, f"{run_id}_metadata.json")
-        with open(metadata_file, 'r') as f:
+        meta_path = os.path.join(output_dir, f"{run_id}_metadata.json")
+        with open(meta_path, 'r') as f:
             metadata = json.load(f)
-        
-        # Get file paths
-        edge_file = os.path.join(output_dir, metadata['files']['edges'])
-        attr_file = os.path.join(output_dir, metadata['files']['attributes'])
-        
-        # Load sparse matrix
-        edge_matrix = sp.load_npz(edge_file)
-        
-        # Convert to COO format to get edge list
-        edge_matrix_coo = edge_matrix.tocoo()
-        edge_list = list(zip(edge_matrix_coo.row, edge_matrix_coo.col))
-        
-        # Load attributes
-        attributes = dict(np.load(attr_file))
-        
+
+        files = metadata.get('files', {})
+
+        # ---- New fast-pairs format ----
+        if 'pairs' in files and files['pairs'] is not None:
+            pair_path = os.path.join(output_dir, files['pairs'])
+            # Load without mmap to keep portability; switch to mmap_mode='r' if needed
+            data = np.load(pair_path)
+            s = data['s'].astype(np.int32, copy=False)
+            t = data['t'].astype(np.int32, copy=False)
+            # Support both long and short keys for attributes
+            if 'd' in data:
+                d = data['d'].astype(np.float32, copy=False)
+            else:
+                d = data['distance'].astype(np.float32, copy=False)
+            sc = (data['sc'] if 'sc' in data else data['source_cluster']).astype(np.int32, copy=False)
+            tc = (data['tc'] if 'tc' in data else data['target_cluster']).astype(np.int32, copy=False)
+
+            edge_list = list(zip(s.tolist(), t.tolist()))
+            attributes = {'source_cluster': sc, 'target_cluster': tc, 'distance': d}
+            return edge_list, attributes, metadata
+
+        # ---- Legacy CSR+attributes format (backward compatibility) ----
+        # Expect: { 'edges': '<file>.npz', 'attributes': '<file>.npz' }
+        edge_file = files.get('edges', None)
+        attr_file = files.get('attributes', None)
+        if edge_file is None or attr_file is None:
+            raise ValueError(f"Metadata for run '{run_id}' does not contain recognized file entries: {files}")
+
+        edge_matrix = sp.load_npz(os.path.join(output_dir, edge_file))
+        coo = edge_matrix.tocoo()
+        edge_list = list(zip(coo.row.tolist(), coo.col.tolist()))
+
+        attrs = dict(np.load(os.path.join(output_dir, attr_file)))
+        # Normalize keys to the new names for callers
+        attributes = {
+            'source_cluster': attrs.get('source_cluster', attrs.get('sc')).astype(np.int32, copy=False),
+            'target_cluster': attrs.get('target_cluster', attrs.get('tc')).astype(np.int32, copy=False),
+            'distance': attrs.get('distance', attrs.get('d')).astype(np.float32, copy=False),
+        }
         return edge_list, attributes, metadata
 
+
 # ============================================================================
-# SEQUENTIAL PROCESSING
+# OUTPUT HELPERS FOR RESOLUTION RUN USAGE
+#   - save_interface_edges_pairs_df: write from a DataFrame (fast pairs format)
+#   - process_single_resolution: reuse per-run iface DF; fall back to dict path
 # ============================================================================
 
-def process_single_resolution(resolution, analyzer, output_dir, run_name, 
-                             scale, min_cluster_size, rank_stat_col, 
-                             prev_labels=None, warm_start=True,
-                             save_outputs=True, algorithm="leiden"):
-    """Process a single resolution value."""
-    if prev_labels is not None and warm_start:
-        initial_membership = prev_labels
-    else:
-        initial_membership = None
-    
-    # Generate run ID
-    run_id = f"{run_name}_res{resolution}"
-    
-    # Run community detection
+import os, json
+from datetime import datetime
+from typing import Dict, Any
+import numpy as np
+
+def save_interface_edges_pairs_df(
+    iface_df,
+    output_file: str,
+    metadata: Dict[str, Any],
+    *,
+    dedup: bool = True,
+    compress: bool = False,
+) -> None:
+    """
+    Save interface edges from a pandas DataFrame to fast pairs format.
+
+    Expects columns (at minimum):
+      - 'source' (int), 'target' (int), 'distance' (float),
+      - 'source_cluster' (int), 'target_cluster' (int)
+
+    Writes:
+      <output_file>_pairs.npz  (arrays: s, t, d, sc, tc)
+      <output_file>_metadata.json
+    """
+    with perf_monitor.timed_operation("Save interface edges"):
+        # Handle empty
+        if iface_df is None or len(iface_df) == 0:
+            md = dict(metadata)
+            md["edge_count"] = 0
+            md["files"] = {"pairs": None}
+            with open(output_file + "_metadata.json", "w") as f:
+                json.dump(md, f, indent=2)
+            return
+
+        # Pull arrays (ignore 'similarity' if present to avoid heavy recomputation)
+        s = iface_df["source"].to_numpy(dtype=np.uint32, copy=False)
+        t = iface_df["target"].to_numpy(dtype=np.uint32, copy=False)
+        d = iface_df["distance"].to_numpy(dtype=np.float32, copy=False)
+
+        # Prefer precomputed clusters if present; else map from a single run df if needed
+        if "source_cluster" in iface_df.columns and "target_cluster" in iface_df.columns:
+            sc = iface_df["source_cluster"].to_numpy(dtype=np.int32, copy=False)
+            tc = iface_df["target_cluster"].to_numpy(dtype=np.int32, copy=False)
+        else:
+            # Safe fallback to zeros if columns missing (shouldn't happen with current pipeline)
+            sc = np.zeros_like(s, dtype=np.int32)
+            tc = np.zeros_like(t, dtype=np.int32)
+
+        # Canonical orientation: s <= t
+        s_c = np.minimum(s, t, dtype=np.uint32)
+        t_c = np.maximum(s, t, dtype=np.uint32)
+
+        # Optional dedup via 64-bit key
+        if dedup and s_c.size:
+            keys = (s_c.astype(np.uint64) << 32) | t_c.astype(np.uint64)
+            order = np.argsort(keys, kind="mergesort")
+            ks = keys[order]
+            keep = np.empty(ks.size, dtype=bool)
+            keep[0] = True
+            if ks.size > 1:
+                keep[1:] = ks[1:] != ks[:-1]
+            idx = order[keep]
+            s_c, t_c = s_c[idx], t_c[idx]
+            d, sc, tc = d[idx], sc[idx], tc[idx]
+
+        # Persist (np.savez is faster than compressed)
+        out_pairs = output_file + "_pairs.npz"
+        saver = np.savez_compressed if compress else np.savez
+        saver(out_pairs, s=s_c, t=t_c, d=d, sc=sc, tc=tc)
+
+        # Metadata
+        md = dict(metadata)
+        md["edge_count"] = int(s_c.size)
+        md["files"] = {"pairs": os.path.basename(out_pairs)}
+        with open(output_file + "_metadata.json", "w") as f:
+            json.dump(md, f, indent=2)
+
+def process_single_resolution(
+    resolution,
+    analyzer,
+    output_dir,
+    run_name,
+    scale,
+    min_cluster_size,
+    rank_stat_col,
+    prev_labels=None,
+    warm_start=True,
+    save_outputs=True,
+    algorithm="leiden_igraph",
+):
+    tag = _fmt_res(resolution)
+    run_id = f"{run_name}_res{tag}"
+
+    initial_membership = prev_labels if (prev_labels is not None and warm_start) else None
+
+    # --- community detection ---
     if algorithm.lower() == "leiden_igraph":
         cluster_stats, labels = analyzer.run_leiden_igraph(
             resolution=resolution,
@@ -2228,7 +2355,7 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
             initial_membership=initial_membership,
             rank_stat_col=rank_stat_col,
             prune_small_clusters=True,
-            min_cluster_size=min_cluster_size
+            min_cluster_size=min_cluster_size,
         )
     elif algorithm.lower() == "louvain_csr":
         cluster_stats, labels = analyzer.run_louvain_csr(
@@ -2238,7 +2365,7 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
             initial_membership=initial_membership,
             rank_stat_col=rank_stat_col,
             prune_small_clusters=True,
-            min_cluster_size=min_cluster_size
+            min_cluster_size=min_cluster_size,
         )
     elif algorithm.lower() == "leiden_csr":
         cluster_stats, labels = analyzer.run_leiden_csr(
@@ -2248,44 +2375,43 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
             initial_membership=initial_membership,
             rank_stat_col=rank_stat_col,
             prune_small_clusters=True,
-            min_cluster_size=min_cluster_size
+            min_cluster_size=min_cluster_size,
         )
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
-    
-    # Calculate community statistics
+
     analyzer.add_community_statistics(run_id)
-    
-    # Save results if requested
+
     if save_outputs:
-        # Create resolution-specific output directory
-        res_dir = os.path.join(output_dir, f"res_{resolution}")
+        res_dir = os.path.join(output_dir, f"res_{tag}")
         os.makedirs(res_dir, exist_ok=True)
-        
-        # Extract interface edges
-        interface_data = analyzer.extract_interface_edges(labels)
-        
-        # Create metadata
+
         metadata = {
-            'run_name': run_name,
-            'resolution': resolution,
-            'scale': scale if isinstance(scale, (int, float)) else 'adaptive',
-            'n_nodes': analyzer.loader.n_nodes,
-            'timestamp': datetime.now().isoformat(),
-            'coarsened': analyzer.coarsened,
-            'coarsening_ratio': getattr(analyzer, 'coarsening_ratio', None),
-            'algorithm': algorithm
+            "run_name": run_name,
+            "resolution": float(resolution),
+            "scale": (scale if isinstance(scale, (int, float)) else "adaptive"),
+            "n_nodes": analyzer.loader.n_nodes,
+            "timestamp": datetime.now().isoformat(),
+            "coarsened": analyzer.coarsened,
+            "coarsening_ratio": getattr(analyzer, "coarsening_ratio", None),
+            "algorithm": algorithm,
         }
-        
-        # Save interface edges
-        output_file = os.path.join(res_dir, f"{run_name}_res{resolution}")
-        save_interface_edges_efficient(interface_data, output_file, metadata)
-        
-        # Save cluster statistics
-        stats_file = os.path.join(res_dir, f"{run_name}_res{resolution}_stats.csv")
+
+        out_base = os.path.join(res_dir, run_id)
+
+        # Prefer reusing the already-built interface df
+        iface_df = analyzer.interface_edges.get(run_id, None)
+        if iface_df is not None and len(iface_df) > 0:
+            save_interface_edges_pairs_df(iface_df, out_base, metadata, dedup=True, compress=False)
+        else:
+            interface_data = analyzer.extract_interface_edges(analyzer.runs[run_id]["labels"])
+            save_interface_edges_efficient(interface_data, out_base, metadata, dedup=True, compress=False)
+
+        stats_file = os.path.join(res_dir, f"{run_id}_stats.csv")
         cluster_stats.to_csv(stats_file, index=False)
-    
+
     return labels
+
 
 # ============================================================================
 # MAIN PIPELINE
@@ -2433,8 +2559,8 @@ def load_results(output_dir, run_name=None, resolution=None):
                 metadata = json.load(f)
                 
             # Extract run ID
-            run_id = metadata.get('run_name', '') + f"_res{res_value}"
-            
+            run_id = metadata.get('run_name', '') + f"_res{_fmt_res(res_value)}"
+
             # Load interface edges
             try:
                 edge_list, attributes, _ = load_interface_edges(os.path.join(output_dir, res_dir), run_id)

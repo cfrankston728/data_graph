@@ -21,6 +21,12 @@ A Python library for creating and refining sparse graphs from data using custom 
 * [Pipeline Stages](#pipeline-stages)
 * [Controlling Density](#controlling-density)
 * [Performance Tips](#performance-tips)
+* [Benchmarking & Timing](#benchmarking--timing)
+
+  * [End-to-End Pipeline (2M scMicroC models)](#endtoend-pipeline-2m-scmicroc-models)
+  * [Example: Large-Scale Run Log](#example-largescale-run-log)
+  * [Timing Summary (parsed)](#timing-summary-parsed)
+  * [Interpreting the Numbers](#interpreting-the-numbers)
 * [Dependencies](#dependencies)
 * [License](#license)
 
@@ -294,66 +300,173 @@ graph_obj, results = generator.build_and_refine_graph(
 
 ---
 
-## End-to-End Example (Latent Means + Scales with Fisher–Rao)
+## Benchmarking & Timing
 
-```python
-from numba import njit
-import numpy as np
-from data_graph import DataGraphGenerator
-from data_graph.knn_dim_reduction import KNNReductionConfig
+### End-to-End Pipeline (2M scMicroC models)
 
-n_dims = 8  # latent dimensionality (example)
+Rough wall-clock times observed on a ~2M-item scMicroC dataset (10kbp scHiC + scRNA), provided for planning/ballparking:
 
-@njit
-def fisher_rao_distance(f, i, j):
-    eps      = 1e-8
-    safe_eps = 1e-30
+* **Data prep**
 
-    means_i  = f[i,  :n_dims] + 0.0
-    sigma_i  = f[i,  n_dims:2*n_dims] + eps
-    means_j  = f[j,  :n_dims] + 0.0
-    sigma_j  = f[j,  n_dims:2*n_dims] + eps
+  * Imputations (10kbp scHiC + scRNA): ~**6 hours**
+  * Submatrix extractions (independent of imputation): ~**1 hour**
+* **Modeling**
 
-    var_term = (sigma_i**2 + sigma_j**2) / 2 + eps
-    ratio    = var_term / (sigma_i * sigma_j)
-    log_term = np.log(np.maximum(ratio, 1e-16))
+  * VAE training (~50 epochs, batch 512): ~**5–6 hours**
+  * Full dataset encodings: ~**1–2 hours** *(can be faster with larger batch size)*
+* **Graph**
 
-    diff = means_i - means_j
-    d2   = 2 * np.sum(diff**2 / var_term + log_term)
-    return np.sqrt(max(safe_eps, d2))
+  * Build data graph: ~**10–30 minutes** *(~10 min with no QC/polishing)*
+  * Save data graph: ~**3 minutes**
+  * Load data graph: ~**30 seconds**
+  * Coarsen/sparsify (for fast Louvain/Leiden): ~**10 minutes** *(one-time; could be amortized in graph gen)*
+  * Leiden per resolution (post-coarsen/sparsify): ~**10–15 minutes**
 
-def logspace_embedding_with_noise(row, noise_scale=1e-6):
-    means  = np.array([row[f"latent_{k+1}"] for k in range(n_dims)], dtype=np.float32)
-    sigmas = np.array([row[f"sig_{k+1}"]    for k in range(n_dims)], dtype=np.float32)
+    * Warm-starts across successive resolutions are theoretically feasible but would require adding support in csr-native implementations (see discussion: [https://github.com/sknetwork-team/scikit-network/discussions/588#discussioncomment-13761800](https://github.com/sknetwork-team/scikit-network/discussions/588#discussioncomment-13761800)).
 
-    emb = np.zeros(2 * n_dims, dtype=np.float32)
-    emb[0::2] = means / sigmas
-    emb[1::2] = np.sqrt(2, dtype=np.float32) * np.log(np.maximum(sigmas, 1e-12))
-    emb += np.random.randn(emb.size).astype(np.float32) * noise_scale
-    return emb
+> Actual times depend on hardware (CPU cores/threads, RAM, storage throughput) and FAISS index settings.
 
-generator = DataGraphGenerator(
-    node_df=model_df,  # your dataframe with latent_* and sig_* columns
-    feature_cols=[f"latent_{k+1}" for k in range(n_dims)] +
-                 [f"sig_{k+1}"    for k in range(n_dims)],
-    premetric_weight_function=fisher_rao_distance,
-    embedding_function=logspace_embedding_with_noise,
-    verbose=True,
-    knn_reduction=KNNReductionConfig(
-        method="ipca", var=0.98, random_state=0, cast_float32=True
-    ),
-    knn_weights_from="original",
-    knn_backend="faiss",
-    knn_backend_opts=dict(index_factory="HNSW32,Flat", metric="l2")
-)
+---
 
-graph_obj, results = generator.build_and_refine_graph(
-    n_neighbors=100,
-    mst_iterations=1,
-    polish_iterations=1,
-    preserve_mst=True
-)
+### Example: Large-Scale Run Log
+
+Below is an excerpt from running the interface-detection pipeline on a graph with **2,056,772 nodes** and **330,372,002 edges** (persistent pool of 32 threads):
+
 ```
+Starting optimized pipeline...
+Processing 2 resolutions: [1.5, 1.75]
+
+Loading graph...
+  Nodes: 2,056,772
+  Edges: 330,372,002
+  [Graph loading] completed in 30.60 seconds
+
+Initializing analyzer...
+Analyzer initialized (lazy mode)
+  Nodes: 2,056,772
+  Edges: 330,372,002
+
+Pre-building CSR for interface detection...
+Loading CSR graph structure from cache...
+  [Analyzer initialization] completed in 22.63 seconds
+
+Processing resolutions sequentially...
+Preparing graph…
+  Pre-coarsening sparsification step
+Sparsifying pre-coarsened graph (k=80)…
+  Sparsified pre-coarsened graph to 324,666,490 edges
+  → Coarsening step
+Applying 2 levels of coarsening…
+  Spawning a persistent pool of 32 threads
+  Level 1: 2056772 nodes
+    → 1769564 meta‐nodes (ratio: 0.860)
+    Building meta-edges of coarsened graph...
+    Computing target batching for edge aggregation...
+    Organizing edge batches...
+    Aggregating edge batches in parallel...
+    Combining aggregated edges...
+    → Aggregated to 228602194 edges; distances tracked
+Sparsifying post-coarsened graph (k=68)…
+  Sparsified to 237,643,288 edges
+  Level 2: 1769564 nodes
+    → 1689972 meta‐nodes (ratio: 0.955)
+    Stopping early
+
+--- Running CSR-native Leiden with resolution=1.5 ---
+Found 26 communities
+Calculating cluster statistics...
+Applying standardized Yeo-Johnson transform to 'RNA_stat'...
+Created transformed column 'RNA_stat_transformed'
+
+Pruning small clusters:
+- Size threshold: 50 (knee point at index 25)
+- Kept 26 clusters, pruned 0 clusters
+Identifying interface edges...
+Found 123052888 interface edges:
+  - 123052888 cross-community edges
+  - 0 edges in pruned communities
+Calculating community statistics for run 'experiment1_res1.5'...
+  [Process resolution 1.5] completed in 1456.39 seconds
+
+--- Running CSR-native Leiden with resolution=1.75 ---
+Found 30 communities
+Calculating cluster statistics...
+Applying standardized Yeo-Johnson transform to 'RNA_stat'...
+Created transformed column 'RNA_stat_transformed'
+
+Pruning small clusters:
+- Size threshold: 50 (knee point at index 29)
+- Kept 30 clusters, pruned 0 clusters
+Identifying interface edges...
+Found 130296504 interface edges:
+  - 130296504 cross-community edges
+  - 0 edges in pruned communities
+Calculating community statistics for run 'experiment1_res1.75'...
+  [Process resolution 1.75] completed in 1065.85 seconds
+
+Pipeline complete!
+Processed 2 resolutions: [1.5, 1.75]
+Results saved to: /home/groups/CEDAR/franksto/00_PROJECT_HUB/version_1/projects/HiC_VAE/version-1.0/data/2025-10-20/2025-10-18_scMicroC_32D_QC_data_graph_YES_GC_3/leiden_csr_graph_interfaces
+
+======== TIMING SUMMARY ========
+Total execution time: 2575.47 seconds
+
+Breakdown by operation:
+  Process resolution 1.5            1456.39s ( 56.55%)  |  1 calls, avg 1456.3926s per call
+  Process resolution 1.75           1065.85s ( 41.38%)  |  1 calls, avg 1065.8484s per call
+  Leiden clustering (res=1.75)       773.58s ( 30.04%)  |  1 calls, avg 773.5765s per call
+  Leiden clustering (res=1.5)        743.20s ( 28.86%)  |  1 calls, avg 743.1970s per call
+  Identify interface edges           369.77s ( 14.36%)  |  2 calls, avg 184.8865s per call
+  Save interface edges               145.95s (  5.67%)  |  2 calls, avg 72.9734s per call
+  Pre-coarsened graph sparsification      59.19s (  2.30%)  |  1 calls, avg 59.1920s per call
+  Graph sparsification                43.42s (  1.69%)  |  1 calls, avg 43.4177s per call
+  Graph loading                       30.60s (  1.19%)  |  1 calls, avg 30.5975s per call
+  Analyzer initialization             22.63s (  0.88%)  |  1 calls, avg 22.6323s per call
+  Load edge arrays                    20.74s (  0.81%)  |  1 calls, avg 20.7416s per call
+  Calculate community statistics (run=experiment1_res1.5)      19.00s (  0.74%)  |  1 calls, avg 18.9978s per call
+  Calculate community statistics (run=experiment1_res1.75)      17.93s (  0.70%)  |  1 calls, avg 17.9313s per call
+  Load CSR cache                       8.10s (  0.31%)  |  1 calls, avg 8.0975s per call
+  Process cluster statistics           1.80s (  0.07%)  |  2 calls, avg 0.8990s per call
+  Load node dataframe                  1.75s (  0.07%)  |  1 calls, avg 1.7535s per call
+  Process cluster labels               1.23s (  0.05%)  |  2 calls, avg 0.6157s per call
+  Store run results                    0.00s (  0.00%)  |  2 calls, avg 0.0000s per call
+================================
+
+Closing analyzer pool...
+Coarsening pool closed.
+```
+
+---
+
+### Timing Summary (parsed)
+
+| Operation                            | Time (s) |  Share | Calls | Avg/Call (s) |
+| ------------------------------------ | -------: | -----: | ----: | -----------: |
+| Process resolution **1.5**           |  1456.39 | 56.55% |     1 |      1456.39 |
+| Process resolution **1.75**          |  1065.85 | 41.38% |     1 |      1065.85 |
+| Leiden clustering (res=1.75)         |   773.58 | 30.04% |     1 |       773.58 |
+| Leiden clustering (res=1.5)          |   743.20 | 28.86% |     1 |       743.20 |
+| Identify interface edges (both runs) |   369.77 | 14.36% |     2 |       184.89 |
+| Save interface edges                 |   145.95 |  5.67% |     2 |        72.97 |
+| Pre-coarsened graph sparsification   |    59.19 |  2.30% |     1 |        59.19 |
+| Graph sparsification (post-coarsen)  |    43.42 |  1.69% |     1 |        43.42 |
+| Graph loading                        |    30.60 |  1.19% |     1 |        30.60 |
+| Analyzer initialization              |    22.63 |  0.88% |     1 |        22.63 |
+| Load edge arrays                     |    20.74 |  0.81% |     1 |        20.74 |
+
+**Total:** 2575.47 s (~42.9 min)
+
+---
+
+### Interpreting the Numbers
+
+* **Leiden dominates** when run on very large graphs; consider:
+
+  * Running **coarsening + sparsification** (already ~10 min one-time) to shrink the problem.
+  * Using **fewer / smarter interface-edge checks** if you only need cross-community boundaries on a subset.
+  * Implementing **warm-starts** across nearby resolutions (requires support in csr-native backends; see discussion linked above).
+* **I/O is small** relative to compute on SSD/NVMe (~3 min save, ~30 s load).
+* **Pre-KNN reduction** and **FAISS index choice** can cut graph build time significantly without hurting neighbor recall when tuned properly.
 
 ---
 

@@ -6,7 +6,6 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import cg
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
-from scipy.sparse.linalg import cg
 from .core_utilities import TimingStats
 
 # --- Lazy loaders for heavy/optional deps -------------------------------------
@@ -86,272 +85,73 @@ def distances_to_similarities(A, mode="exp"):
     P = Dinv @ A
     return P  # row-stochastic
 
-def keep_topk_per_row(A, k):
+def sample_landmarks_knn_blue_noise(A, quota, min_hops=2, degree_bias=0.5, seed=42, per_component_labels=None):
     """
-    Keep the largest k entries per row of CSR matrix A (ties arbitrary),
-    zero the diagonal, eliminate explicit zeros, and row-normalize.
-
-    Returns a CSR with at most k nonzeros per row and row sums = 1
-    (rows that were empty remain empty; normalization is safe).
+    Blue-noise-ish landmark sampling with δ-hop blocking on a KNN graph.
+    quota: int or array per-component; if int, interpreted as global count.
+    per_component_labels: optional array of component ids (len n)
     """
-    A = A.tocsr()
-    indptr, indices, data = A.indptr, A.indices, A.data
-    n, m = A.shape
-
-    # First pass: exact nnz after pruning
-    row_nnz = np.diff(indptr)
-    keep_counts = np.minimum(k, row_nnz)
-    nnz_out = int(keep_counts.sum())
-
-    # Preallocate output buffers
-    out_rows = np.empty(nnz_out, dtype=np.int32)
-    out_cols = np.empty(nnz_out, dtype=np.int32)
-    out_data = np.empty(nnz_out, dtype=data.dtype)
-
-    w = 0  # write cursor
-    for i in range(n):
-        s, e = indptr[i], indptr[i + 1]
-        cnt = e - s
-        if cnt <= 0:
-            continue
-
-        if cnt > k:
-            row_vals = data[s:e]
-            row_cols = indices[s:e]
-            # indices of the largest k values
-            part = np.argpartition(row_vals, cnt - k)[cnt - k:]
-            # sort those k descending
-            order = np.argsort(row_vals[part])[::-1]
-            sel = part[order]
-            j = k
-            out_rows[w:w + j] = i
-            out_cols[w:w + j] = row_cols[sel]
-            out_data[w:w + j] = row_vals[sel]
-            w += j
-        else:
-            j = cnt
-            out_rows[w:w + j] = i
-            out_cols[w:w + j] = indices[s:e]
-            out_data[w:w + j] = data[s:e]
-            w += j
-
-    # Assemble; zero diag; remove zeros
-    B = csr_matrix((out_data, (out_rows, out_cols)), shape=(n, m))
-    B.setdiag(0.0)
-    B.eliminate_zeros()
-
-    # Row-normalize (safe on empty rows)
-    rs = np.asarray(B.sum(axis=1)).ravel().astype(np.float32)
-    rs[rs == 0.0] = 1.0
-    return sp.diags(1.0 / rs, dtype=np.float32) @ B
-
-
-def _keep_smallest_k_per_row(A, k):
-    """
-    Keep the smallest k entries per row of CSR matrix A (ties arbitrary).
-    Diagonal is zeroed; no normalization (useful for *distance* pruning).
-    """
-    A = A.tocsr()
-    indptr, indices, data = A.indptr, A.indices, A.data
-    n, m = A.shape
-
-    row_nnz = np.diff(indptr)
-    keep_counts = np.minimum(k, row_nnz)
-    nnz_out = int(keep_counts.sum())
-
-    out_rows = np.empty(nnz_out, dtype=np.int32)
-    out_cols = np.empty(nnz_out, dtype=np.int32)
-    out_data = np.empty(nnz_out, dtype=data.dtype)
-
-    w = 0
-    for i in range(n):
-        s, e = indptr[i], indptr[i + 1]
-        cnt = e - s
-        if cnt <= 0:
-            continue
-
-        if cnt > k:
-            row_vals = data[s:e]
-            row_cols = indices[s:e]
-            # indices of the smallest k values
-            part = np.argpartition(row_vals, k - 1)[:k]
-            order = np.argsort(row_vals[part])
-            sel = part[order]
-            j = k
-            out_rows[w:w + j] = i
-            out_cols[w:w + j] = row_cols[sel]
-            out_data[w:w + j] = row_vals[sel]
-            w += j
-        else:
-            j = cnt
-            out_rows[w:w + j] = i
-            out_cols[w:w + j] = indices[s:e]
-            out_data[w:w + j] = data[s:e]
-            w += j
-
-    B = csr_matrix((out_data, (out_rows, out_cols)), shape=(n, m))
-    B.setdiag(0.0)
-    B.eliminate_zeros()
-    return B
-
-
-def keep_topk_per_row_fast(A, k):
-    """
-    Back-compat alias: use the optimized keep_topk_per_row.
-    """
-    return keep_topk_per_row(A, k)
-
-
-def sample_landmarks_knn_blue_noise_fast(
-    A,
-    quota,
-    min_hops=2,
-    degree_bias=0.5,
-    seed=42,
-    per_component_labels=None,
-    k_prune=32,
-    sym_block=True,  # make the pruned graph undirected for blocking only
-):
-    """
-    Faster blue-noise landmark sampling:
-      - prunes the *blocking* graph to k_prune smallest neighbors per row
-      - optional symmetrization for stable 2-hop neighborhoods
-      - per-component weighted random permutation (Efraimidis–Spirakis keys)
-      - greedy accept-if-unblocked; vectorized 1/2-hop blocking
-    """
-    from scipy.sparse.csgraph import connected_components
-
-    A = A.tocsr()
-
-    # Blocking graph (speed only; original A is untouched downstream)
-    A_s = _keep_smallest_k_per_row(A, k_prune) if k_prune else A
-    if sym_block:
-        A_s = A_s.maximum(A_s.T).tocsr()
-
-    n = A_s.shape[0]
-    indptr, indices = A_s.indptr, A_s.indices
-    deg = np.diff(indptr).astype(np.int64)
-
-    # Component labels for quota (use original graph)
-    if per_component_labels is None:
-        _, comps = connected_components(A, directed=False)
-    else:
-        comps = np.asarray(per_component_labels, dtype=np.int32)
-
-    sizes = np.bincount(comps, minlength=(comps.max() + 1 if comps.size else 0))
-
-    def _normalize_quota(sizes_arr, q):
-        if np.isscalar(q):
-            total = int(q) if q > 1 else int(np.ceil(float(q) * sizes_arr.sum()))
-            total = max(0, min(total, int(sizes_arr.sum())))
-            if total == 0:
-                return np.zeros_like(sizes_arr, dtype=np.int64)
-            props = sizes_arr / max(sizes_arr.sum(), 1)
-            raw = props * total
-            out = np.minimum(sizes_arr, np.floor(raw).astype(np.int64))
-            rem = total - int(out.sum())
-            if rem > 0:
-                frac = raw - out
-                for j in np.argsort(frac)[::-1]:
-                    if rem == 0:
-                        break
-                    if out[j] < sizes_arr[j]:
-                        out[j] += 1
-                        rem -= 1
-            return out
-        qv = np.asarray(q, dtype=np.int64)
-        return np.minimum(qv, sizes_arr)
-
-    per_comp_quota = _normalize_quota(sizes, quota)
-
     rng = np.random.default_rng(seed)
-    blocked = np.zeros(n, dtype=np.uint8)  # global mask; safe since comps are disjoint
+    A = A.tocsr()
+    n = A.shape[0]
+    deg = np.diff(A.indptr)
 
-    def block_radius(u: int, hops: int):
-        """Vectorized 1/2-hop; tiny BFS only if hops > 2."""
-        blocked[u] = 1
-        if hops <= 0:
-            return
-        # 1-hop neighbors
-        s, e = indptr[u], indptr[u + 1]
-        nbr1 = indices[s:e]
-        if nbr1.size:
-            blocked[nbr1] = 1
-        if hops == 1:
-            return
-        # 2-hop neighbors
-        if nbr1.size:
-            starts = indptr[nbr1]
-            ends = indptr[nbr1 + 1]
-            nbr2 = np.concatenate(
-                [indices[ss:ee] for ss, ee in zip(starts, ends)]
-            ) if starts.size else np.empty(0, dtype=indices.dtype)
-            if nbr2.size:
-                blocked[nbr2] = 1
-        if hops > 2:
-            # rare path: minimal BFS
-            from collections import deque
-            q = deque([(int(u), 0)])
-            seen = {int(u)}
-            while q:
-                x, d = q.popleft()
-                if d >= hops:
-                    continue
-                sx, ex = indptr[x], indptr[x + 1]
-                for y in indices[sx:ex]:
-                    if y in seen:
-                        continue
-                    seen.add(int(y))
-                    blocked[y] = 1
-                    q.append((int(y), d + 1))
+    # handle per-component quotas
+    if per_component_labels is None:
+        comps = np.zeros(n, dtype=np.int32)
+        comp_ids = [0]
+    else:
+        comps = per_component_labels.astype(np.int32)
+        comp_ids = np.unique(comps)
 
     selected = []
+    blocked = np.zeros(n, dtype=bool)
 
-    for c in np.unique(comps):
+    for c in comp_ids:
         idx = np.where(comps == c)[0]
         if idx.size == 0:
             continue
+        if np.isscalar(quota):
+            s_c = max(int(np.ceil(quota * idx.size)) if quota < 1.0 else min(quota, idx.size), 1)
+        else:
+            s_c = int(quota[c])
 
-        s_c = int(min(per_comp_quota[c], idx.size))
-        if s_c <= 0:
-            continue
+        # seed: highest-degree node in the component
+        i0 = idx[np.argmax(deg[idx])]
+        selected.append(i0); blocked[i0] = True
 
-        # weights ∝ degree^degree_bias (≥1)
-        w = np.maximum(deg[idx], 1).astype(np.float64)
-        if degree_bias != 0:
-            w = np.power(w, degree_bias)
+        # block δ hops around a node
+        def block_hops(src):
+            frontier = [src]
+            vis = set([src])
+            for _ in range(min_hops):
+                nxt = []
+                for u in frontier:
+                    s, e = A.indptr[u], A.indptr[u+1]
+                    for v in A.indices[s:e]:
+                        if v not in vis:
+                            vis.add(v); nxt.append(v)
+                frontier = nxt
+                if not frontier: break
+            blocked[list(vis)] = True
 
-        # Efraimidis–Spirakis key: smaller ⇒ earlier in order
-        U = rng.random(idx.size)
-        keys = -np.log(U + 1e-12) / w
-        order = idx[np.argsort(keys)]
+        block_hops(i0)
 
-        chosen = 0
-        for u in order:
-            if blocked[u]:
-                continue
-            selected.append(int(u))
-            chosen += 1
-            block_radius(int(u), min_hops)
-            if chosen >= s_c:
-                break
+        # candidate weights (degree^bias) within component
+        cand = idx.copy()
+        w = deg[cand] ** degree_bias
+        w = w / (w.sum() + 1e-12)
 
-        # Fallback fill if spacing exhausted candidates
-        if chosen < s_c:
-            rem = order[blocked[order] == 0]
-            if chosen > 0:
-                picked_set = set(selected[-chosen:])
-                rem = np.array([u for u in rem if u not in picked_set], dtype=rem.dtype)
-            take = min(s_c - chosen, rem.size)
-            if take > 0:
-                fill = rem[:take]
-                selected.extend(fill.tolist())
-                blocked[fill] = 1  # pin without extra spacing
+        while len([j for j in selected if comps[j]==c]) < s_c:
+            # resample until we hit an unblocked candidate
+            for _ in range(1000):
+                cand_j = rng.choice(cand, p=w)
+                if not blocked[cand_j]:
+                    break
+            selected.append(cand_j)
+            block_hops(cand_j)
 
-    return np.unique(np.asarray(selected, dtype=np.int64))
-
-
-
+    return np.array(selected, dtype=np.int64)
 
 def harmonic_interpolate(P, landmarks, Y_land, max_iter=200, tol=1e-3, alpha=1.0, init=None):
     """
@@ -389,41 +189,13 @@ def harmonic_interpolate(P, landmarks, Y_land, max_iter=200, tol=1e-3, alpha=1.0
         rel = np.linalg.norm(Y - Y_old) / (np.linalg.norm(Y_old) + 1e-9)
         if rel < tol:
             break
-        if np.max(np.abs(Y - Y_old)) / (np.max(np.abs(Y_old)) + 1e-9) < tol:
-            break
     return Y
-
-def laplacian_cg_interpolate(W, landmarks, Y_land, tol=1e-3, max_iter=200):
-    W = W.tocsr().astype(np.float32)
-    n, d = W.shape[0], Y_land.shape[1]
-    deg = np.asarray(W.sum(axis=1)).ravel().astype(np.float32)
-    L = sp.diags(deg) - W  # symmetric PSD
-    mask = np.ones(n, dtype=bool); mask[landmarks] = False
-    U = np.where(mask)[0]
-
-    L_UU = L[U][:, U]
-    L_UL = L[U][:, landmarks]
-    B = - L_UL @ Y_land  # (|U|, d)
-
-    Y = np.zeros((n, d), dtype=np.float32)
-    Y[landmarks] = Y_land
-
-    for j in range(d):
-        # robust to both SciPy signatures
-        try:
-            yj, _ = cg(L_UU, B[:, j], rtol=tol, atol=0.0, maxiter=int(max_iter))
-        except TypeError:
-            yj, _ = cg(L_UU, B[:, j], tol=tol, maxiter=int(max_iter))
-        Y[U, j] = yj.astype(np.float32)
-    return Y
-
-
 
 def umap_via_landmarks_and_interpolation(graph_csr, n_landmarks=30000, ratio=None,
                                          min_hops=2, n_neighbors_umap=15, min_dist=0.1,
                                          sim_mode="exp", interp="harmonic",
                                          max_iter=150, tol=1e-3, random_state=42,
-                                         n_components=2, visualizer=None, topk_interpolation=32):
+                                         n_components=2, visualizer=None):
     """
     End-to-end: sample landmarks, run UMAP on landmark subgraph, interpolate rest.
     """
@@ -441,31 +213,28 @@ def umap_via_landmarks_and_interpolation(graph_csr, n_landmarks=30000, ratio=Non
         nL = min(n_landmarks, n)
 
     # per-component proportional quota
-    # replace the quota calc with the safer rounding
     sizes = np.bincount(comp_labels)
-    props = sizes / sizes.sum()
-    raw   = props * nL
-    floor = np.maximum(1, np.minimum(sizes, np.floor(raw).astype(int)))
-    if floor.sum() > nL:
-        take = floor.sum() - nL
-        for j in np.argsort(floor)[::-1]:
-            if take == 0: break
-            dec = min(take, max(0, floor[j]-1))
-            floor[j] -= dec; take -= dec
-    else:
-        give = nL - floor.sum()
-        frac = raw - floor
-        for j in np.argsort(frac)[::-1]:
-            if give == 0: break
-            if floor[j] < sizes[j]:
-                floor[j] += 1; give -= 1
-    quota = floor
-    landmarks = sample_landmarks_knn_blue_noise_fast(A, quota=quota, min_hops=min_hops,
+    quota = np.maximum((sizes / sizes.sum()) * nL, np.minimum(10, nL)).astype(int)
+
+    landmarks = sample_landmarks_knn_blue_noise(A, quota=quota, min_hops=min_hops,
                                                 degree_bias=0.5, seed=random_state,
                                                 per_component_labels=comp_labels)
 
     # induced landmark subgraph (optionally densify)
-    A_L = A[landmarks][:, landmarks].tocsr()
+    rows, cols = [], []
+    data = []
+    A = A.tocsr()
+    land_set = set(landmarks.tolist())
+    for i in landmarks:
+        s, e = A.indptr[i], A.indptr[i+1]
+        nbr = A.indices[s:e]; w = A.data[s:e]
+        mask = np.isin(nbr, landmarks)
+        rows.extend([np.where(landmarks==i)[0][0]] * int(mask.sum()))
+        cols.extend(np.searchsorted(landmarks, np.sort(landmarks[np.searchsorted(landmarks, nbr[mask])])))
+        data.extend(w[mask])
+    A_L = csr_matrix((np.array(data), (np.array(rows), np.array(cols))),
+                     shape=(len(landmarks), len(landmarks)))
+    # light densification: add top-κ mutual neighbors among landmarks if too sparse (optional)
 
     # run UMAP on landmarks
     if visualizer is None:
@@ -482,9 +251,6 @@ def umap_via_landmarks_and_interpolation(graph_csr, n_landmarks=30000, ratio=Non
 
     # build row-stochastic similarity on full graph
     P = distances_to_similarities(graph_csr, mode=sim_mode)
-    # in create_embeddings_2d_and_3d, after P = distances_to_similarities(...)
-    if topk_interpolation is not None:
-        P = keep_topk_per_row(P, topk_interpolation)
 
     # interpolate
     if interp == "barycentric":
@@ -518,150 +284,110 @@ class DataGraphVisualizer:
         
     def prepare_graph_for_umap(self, graph, n_neighbors=15):
         """
-        Pad low-degree nodes by wiring them to a small bank of dummy nodes at a *very large*
-        distance so UMAP's kNN lists can always reach k neighbors without biasing toward
-        the artificial nodes.
-
-        Parameters
-        ----------
+        Create optimized dummy clique with minimal connections and zero weights.
+        
+        Parameters:
+        -----------
         graph : scipy.sparse.csr_matrix
-            Input adjacency where smaller weights are treated as closer (distance-like).
+            The graph to prepare
         n_neighbors : int, default=15
-            Target minimum number of neighbors for each node.
-
-        Returns
-        -------
-        result : scipy.sparse.csr_matrix
-            Padded graph (CSR). If no padding needed, returns the input graph.
-        dummy_info : dict
-            {
-                'has_dummies': bool,
-                'dummy_indices': np.ndarray[int32],       # indices in the padded graph
-                'original_to_dummies': Dict[int, np.ndarray[int32]],
-                'n_original': int,
-                'n_dummies': int
-            }
+            Target minimum number of neighbors for each node
+            
+        Returns:
+        --------
+        scipy.sparse.csr_matrix
+            Prepared graph with dummy nodes if needed
+        dict
+            Information about dummy nodes
         """
         self.timing.start("prepare_graph_for_umap")
-
-        # Ensure CSR
-        G = graph.tocsr()
-        n = G.shape[0]
-        indptr = G.indptr
-
-        # Find low-degree nodes
-        degrees = np.diff(indptr)
+        
+        n = graph.shape[0]
+        degrees = np.diff(graph.indptr)
         low = np.where(degrees < n_neighbors)[0]
-
+        
         if low.size == 0:
-            # Nothing to do
             self.timing.end("prepare_graph_for_umap")
-            return G, {
+            return graph, {
                 'has_dummies': False,
                 'dummy_indices': np.array([], dtype=np.int32),
                 'original_to_dummies': {},
                 'n_original': n,
-                'n_dummies': 0,
+                'n_dummies': 0
             }
-
-        # How many dummy neighbors each low-degree node needs
-        deficits = (n_neighbors - degrees[low]).astype(int)
-        max_deficit = int(deficits.max()) if deficits.size else 0
-
-        # Ensure the dummy nodes themselves also have enough neighbors
-        # (so their own kNN lists are well-defined if queried).
-        dummy_for_dummies = max(0, n_neighbors - low.size + 1)
+        
+        # Calculate optimal dummy count
+        deficits = n_neighbors - degrees[low]
+        max_deficit = int(deficits.max())
+        dummy_for_dummies = max(0, n_neighbors - low.size + 1) 
         optimal_dummy_count = max(max_deficit, dummy_for_dummies)
-
+        
         if self.verbose:
             print(f"  {len(low)} low-degree nodes with max deficit {max_deficit}")
-            print(f"  Creating dummy bank of {optimal_dummy_count} nodes")
-
-        # Early bail if somehow no dummies are required after all checks
-        if optimal_dummy_count <= 0:
-            self.timing.end("prepare_graph_for_umap")
-            return G, {
-                'has_dummies': False,
-                'dummy_indices': np.array([], dtype=np.int32),
-                'original_to_dummies': {},
-                'n_original': n,
-                'n_dummies': 0,
-            }
-
-        # Indices for the dummy nodes in the padded graph
+            print(f"  Creating optimal clique of {optimal_dummy_count} dummy nodes")
+        
+        # Create indices
         dummy_indices = np.arange(n, n + optimal_dummy_count, dtype=np.int32)
-
-        # Choose a *very large* distance so dummy edges never outrank real ones
-        # when sorting ascending by distance.
-        if G.nnz:
-            base = float(G.data.max())
-            LARGE = np.asarray(max(base, 1.0) * 1e6, dtype=G.dtype)
-        else:
-            LARGE = np.asarray(1e6, dtype=G.dtype)
-
-        # ----- Build edges once (COO) and then assemble CSR -----
-        # Grab original edges in COO (one conversion)
-        coo = G.tocoo(copy=False)
-        orig_rows, orig_cols, orig_data = coo.row, coo.col, coo.data
-
-        # (1) Dummy clique (all-to-all except self) with LARGE distances
+        
+        # Create dummy clique (all-to-all connections except self)
         self.timing.start("prepare_graph_for_umap.create_dummy_clique")
-        d_row, d_col = np.meshgrid(dummy_indices, dummy_indices, indexing='ij')
-        mask = (d_row != d_col)
-        clique_rows = d_row[mask].astype(np.int32, copy=False).ravel()
-        clique_cols = d_col[mask].astype(np.int32, copy=False).ravel()
-        clique_data = np.full(clique_rows.shape[0], LARGE, dtype=G.dtype)
+        d_row, d_col = np.meshgrid(dummy_indices, dummy_indices)
+        mask = d_row != d_col  # Exclude self-connections
+        clique_rows = d_row[mask]
+        clique_cols = d_col[mask]
+        clique_data = np.zeros_like(clique_rows, dtype=graph.dtype)  # Zero weights
         self.timing.end("prepare_graph_for_umap.create_dummy_clique")
-
-        # (2) Connect each low-degree node to just as many dummies as needed
+        
+        # Create connections between low-degree nodes and ONLY the needed dummy nodes
         self.timing.start("prepare_graph_for_umap.connect_low_degree")
         cross_rows = []
         cross_cols = []
         original_to_dummies = {}
-
-        # Cap needed by the available dummy count (should already be sufficient)
-        for i, node in enumerate(low.astype(int)):
-            needed = int(deficits[i])
-            if needed <= 0:
-                continue
-            k = min(needed, optimal_dummy_count)
-            node_dummies = dummy_indices[:k]
-            original_to_dummies[node] = node_dummies
-
-            cross_rows.extend([node] * k)
-            cross_cols.extend(node_dummies.tolist())
-
-        cross_rows = np.asarray(cross_rows, dtype=np.int32)
-        cross_cols = np.asarray(cross_cols, dtype=np.int32)
-        cross_data = np.full(cross_rows.shape[0], LARGE, dtype=G.dtype)
-
-        # Reciprocal (dummy -> original) to keep the graph symmetric
+        
+        for i, node in enumerate(low):
+            # Only connect to as many dummies as needed
+            needed = deficits[i]
+            if needed > 0:
+                # Take just the needed number of dummies (first ones for simplicity)
+                node_dummies = dummy_indices[:needed]
+                original_to_dummies[int(node)] = node_dummies
+                
+                # Add these connections
+                cross_rows.extend([node] * len(node_dummies))
+                cross_cols.extend(node_dummies)
+        
+        cross_data = np.zeros(len(cross_rows), dtype=graph.dtype)  # Zero weights
+        
+        # Get reciprocal connections (dummy → node)
         recip_rows = cross_cols
         recip_cols = cross_rows
-        recip_data = np.full(recip_rows.shape[0], LARGE, dtype=G.dtype)
+        recip_data = np.zeros_like(recip_rows, dtype=graph.dtype)  # Zero weights
         self.timing.end("prepare_graph_for_umap.connect_low_degree")
-
-        # (3) Assemble padded matrix in one go
+        
+        # Combine all connections for efficiency
         self.timing.start("prepare_graph_for_umap.build_result_matrix")
-        all_rows = np.concatenate([orig_rows, clique_rows, cross_rows, recip_rows]).astype(np.int32)
-        all_cols = np.concatenate([orig_cols, clique_cols, cross_cols, recip_cols]).astype(np.int32)
-        all_data = np.concatenate([orig_data, clique_data, cross_data, recip_data]).astype(G.dtype, copy=False)
-
-        n_padded = n + optimal_dummy_count
-        result = csr_matrix((all_data, (all_rows, all_cols)), shape=(n_padded, n_padded))
+        all_rows = np.concatenate([graph.tocoo().row, clique_rows, cross_rows, recip_rows])
+        all_cols = np.concatenate([graph.tocoo().col, clique_cols, cross_cols, recip_cols])
+        all_data = np.concatenate([graph.tocoo().data, clique_data, cross_data, recip_data])
+        
+        # Create the result matrix in one operation
+        result = csr_matrix(
+            (all_data, (all_rows, all_cols)), 
+            shape=(n + optimal_dummy_count, n + optimal_dummy_count)
+        )
         self.timing.end("prepare_graph_for_umap.build_result_matrix")
-
+        
+        # Create dummy information
         dummy_info = {
             'has_dummies': True,
             'dummy_indices': dummy_indices,
             'original_to_dummies': original_to_dummies,
             'n_original': n,
-            'n_dummies': optimal_dummy_count,
+            'n_dummies': optimal_dummy_count
         }
-
+        
         self.timing.end("prepare_graph_for_umap")
         return result, dummy_info
-
         
     def create_umap_embedding(self, graph, means=None, sigmas=None, n_neighbors=15, min_dist=0.1, 
                              random_state=42, n_components=2, init='spectral', update_node_df=False):
@@ -1707,273 +1433,57 @@ class DataGraphVisualizer:
         
         return fig, results
     
-    def create_embeddings_2d_and_3d(
-    self,
-    graph,
-    means=None,
-    sigmas=None,
-    n_neighbors=15,
-    min_dist=0.1,
-    random_state=42,
-    init='spectral',
-    update_node_df=True,
-    # --- new knobs ---
-    use_landmarks="auto",          # False | True | "auto"
-    landmark_ratio=0.1,           # ~2% of nodes as landmarks
-    n_landmarks=None,              # overrides ratio if set
-    min_hops=2,                    # δ-hop blue-noise spacing
-    sim_mode="exp",                # similarity from distances: "exp" or "recip"
-    interp="barycentric",             # "harmonic", "barycentric", "laplacian_cg"
-    harmonic_max_iter=150,
-    harmonic_tol=1e-3,
-    small_graph_threshold=100_000, # below this, just do full UMAP
-    topk_interpolation=32
-):
+    def create_embeddings_2d_and_3d(self, graph, means=None, sigmas=None, n_neighbors=15, min_dist=0.1,
+                              random_state=42, init='spectral', update_node_df=True):
         """
-        Landmark UMAP (2D & 3D) with graph-aware interpolation.
-
-        - Selects blue-noise landmarks per component.
-        - Runs UMAP only on the induced landmark subgraph.
-        - Interpolates the rest via harmonic extension (default) or barycentric.
-
-        Falls back to the original two full UMAP runs if use_landmarks=False
-        or the graph is small (threshold).
+        Create both 2D and 3D UMAP embeddings for a graph and optionally update its node_df.
+        
+        Parameters:
+        -----------
+        graph : ManifoldGraph
+            The graph to embed
+        means : numpy.ndarray, optional
+            Mean vectors for initialization (not used for distance computation)
+        sigmas : numpy.ndarray, optional
+            Standard deviation vectors (not used in this method)
+        n_neighbors : int, default=15
+            Number of neighbors for UMAP
+        min_dist : float, default=0.1
+            Minimum distance parameter for UMAP
+        random_state : int, default=42
+            Random seed for reproducibility
+        init : str, default='spectral'
+            Initialization method for UMAP
+        update_node_df : bool, default=True
+            Whether to update the graph's node_df with both 2D and 3D UMAP coordinates
+            
+        Returns:
+        --------
+        tuple
+            (embedding_2d, results_2d, embedding_3d, results_3d)
         """
-        from scipy.sparse import csr_matrix
-        from scipy.sparse.csgraph import connected_components
-
         self.timing.start("create_embeddings_2d_and_3d")
-
-        # ---- resolve adjacency ----
-        if hasattr(graph, 'get_adjacency_matrix'):
-            A = graph.get_adjacency_matrix().tocsr()
-        else:
-            A = graph.tocsr()
-        n = A.shape[0]
-
-        # ---- choose mode ----
-        if use_landmarks == "auto":
-            use_landmarks = (n >= small_graph_threshold)
-        if not use_landmarks:
-            # Original behavior: two full runs
-            if self.verbose:
-                print("[UMAP] Graph is small or landmarks disabled → full UMAP for 2D and 3D.")
-            emb2d, res2d = self.create_umap_embedding(
-                graph, means, sigmas, n_neighbors, min_dist,
-                random_state=random_state, n_components=2, init=init,
-                update_node_df=update_node_df
-            )
-            emb3d, res3d = self.create_umap_embedding(
-                graph, means, sigmas, n_neighbors, min_dist,
-                random_state=random_state, n_components=3, init=init,
-                update_node_df=update_node_df
-            )
-            self.timing.end("create_embeddings_2d_and_3d")
-            return emb2d, res2d, emb3d, res3d
-
-        # ---- landmark selection ----
-        self.timing.start("landmarks.select")
-        n_comp, comp_labels = connected_components(A, directed=False)
-
-        if n_landmarks is None:
-            nL = max(int(landmark_ratio * n), 10)
-        else:
-            nL = min(int(n_landmarks), n)
-
-        # proportional per-component quotas (at least a few per component)
-        sizes = np.bincount(comp_labels)
-        props = sizes / sizes.sum()
-        raw   = props * nL
-        floor = np.maximum(1, np.minimum(sizes, np.floor(raw).astype(int)))  # >=1 and <= component size
-        # ensure we don't exceed nL after floors
-        if floor.sum() > nL:
-            # remove extras from largest floors but keep >=1
-            take = floor.sum() - nL
-            for j in np.argsort(floor)[::-1]:
-                if take == 0: break
-                dec = min(take, max(0, floor[j]-1))
-                floor[j] -= dec; take -= dec
-        else:
-            # give the remainder to largest fractional parts
-            give = nL - floor.sum()
-            frac = raw - floor
-            for j in np.argsort(frac)[::-1]:
-                if give == 0: break
-                if floor[j] < sizes[j]:
-                    floor[j] += 1; give -= 1
-        quotas = floor
-
+        
         if self.verbose:
-            print(f"[UMAP-LANDMARK] n={n:,}, components={n_comp}, target landmarks≈{nL:,}")
-
-        landmarks = sample_landmarks_knn_blue_noise_fast(
-            A, quota=quotas, min_hops=min_hops, degree_bias=0.5,
-            seed=random_state, per_component_labels=comp_labels
+            print("[UMAP] Creating both 2D and 3D embeddings")
+        
+        # Create 2D embedding
+        embedding_2d, results_2d = self.create_umap_embedding(
+            graph, means, sigmas, n_neighbors, min_dist, 
+            random_state=random_state, n_components=2, init=init,
+            update_node_df=update_node_df
         )
-        landmarks = np.unique(landmarks)  # safety
-        nL = len(landmarks)
-        if self.verbose:
-            print(f"[UMAP-LANDMARK] Selected {nL:,} landmarks")
-        self.timing.end("landmarks.select")
-
-        # ---- UMAP on landmarks: 2D & 3D (reuses all prep except final embedding) ----
-        UMAP, fuzzy_simplicial_set, simplicial_set_embedding, find_ab_params = _load_umap_primitives()
-
-        # 1) Build KNN lists for landmarks ONCE (use argpartition over full sort)
-        A_L = A[landmarks][:, landmarks].tocsr()
-        nL = A_L.shape[0]; k = n_neighbors
-        knn_idx  = np.empty((nL, k), dtype=np.int32)
-        knn_dist = np.empty((nL, k), dtype=np.float32)
-        for i in range(nL):
-            s, e = A_L.indptr[i], A_L.indptr[i+1]
-            idx, w = A_L.indices[s:e], A_L.data[s:e]
-            if e - s >= k:
-                part = np.argpartition(w, k-1)[:k]
-                sel_idx, sel_w = idx[part], w[part]
-                order = np.argsort(sel_w)
-                knn_idx[i]  = sel_idx[order]
-                knn_dist[i] = sel_w[order]
-            elif e > s:
-                m = e - s
-                knn_idx[i, :m]  = idx
-                knn_dist[i, :m] = w
-                knn_idx[i, m:]  = i
-                fill = float(w.max()) if m else 1.0
-                knn_dist[i, m:] = fill
-            else:
-                knn_idx[i].fill(i); knn_dist[i].fill(1.0)
-
-        # 2) One fuzzy graph for both dims
-        rng = np.random.RandomState(random_state)
-        dummy_X = np.zeros((nL, 2), dtype=np.float32)   # X is ignored since we supply knn
-        graph_simp, _, _ = fuzzy_simplicial_set(
-            X=dummy_X, n_neighbors=n_neighbors, random_state=rng, metric='euclidean',
-            knn_indices=knn_idx, knn_dists=knn_dist, set_op_mix_ratio=1.0, local_connectivity=1.0
+        
+        # Create 3D embedding
+        embedding_3d, results_3d = self.create_umap_embedding(
+            graph, means, sigmas, n_neighbors, min_dist, 
+            random_state=random_state, n_components=3, init=init,
+            update_node_df=update_node_df
         )
-        # after:
-        um = UMAP(n_neighbors=n_neighbors, min_dist=min_dist, n_components=2, random_state=random_state)
-        a, b = find_ab_params(um.spread, min_dist)
-        epochs = 100 if (um.n_epochs is None or um.n_epochs <= 0) else min(int(um.n_epochs), 100)
-
-        # --- 2D on landmarks ---
-        emb_L_2d = simplicial_set_embedding(
-            data=None,
-            graph=graph_simp,
-            n_components=2,
-            initial_alpha=um.learning_rate,
-            a=a,
-            b=b,
-            gamma=um.repulsion_strength,
-            negative_sample_rate=2,
-            n_epochs=epochs,
-            init='spectral',
-            random_state=rng,
-            metric=um.metric,
-            metric_kwds=getattr(um, 'metric_kwds', {}),   # ← add
-            densmap=False,
-            densmap_kwds=getattr(um, 'densmap_kwds', {}), # ← add
-            output_dens=False,
-            verbose=False
-        )[0].astype(np.float32, copy=False)
-
-        # warm start for 3D
-        init3 = np.hstack([emb_L_2d, 1e-3 * rng.standard_normal((nL, 1)).astype(np.float32)])
-
-        # --- 3D on landmarks ---
-        emb_L_3d = simplicial_set_embedding(
-            data=None,
-            graph=graph_simp,
-            n_components=3,
-            initial_alpha=um.learning_rate,
-            a=a,
-            b=b,
-            gamma=um.repulsion_strength,
-            negative_sample_rate=2,
-            n_epochs=epochs,
-            init=init3,
-            random_state=rng,
-            metric=um.metric,
-            metric_kwds=getattr(um, 'metric_kwds', {}),   # ← add
-            densmap=False,
-            densmap_kwds=getattr(um, 'densmap_kwds', {}), # ← add
-            output_dens=False,
-            verbose=False
-        )[0].astype(np.float32, copy=False)
-
-
-        # ---- build row-stochastic similarity P once ----
-        self.timing.start("interpolation.P_build")
-        P = distances_to_similarities(A, mode=sim_mode)  # row-stochastic
-        # after: P = distances_to_similarities(A, mode=sim_mode)
-        if topk_interpolation:  # or just call the function directly if in scope
-            P = keep_topk_per_row(P, topk_interpolation)  # or expose a param; 16–64 works well
-
-        self.timing.end("interpolation.P_build")
-
-        # ---- interpolate to all nodes (2D & 3D) ----
-        self.timing.start("interpolation.2d")
-        if interp == "barycentric":
-            P_L = P[:, landmarks]
-            denom = (np.array(P_L.sum(axis=1)).ravel() + 1e-12)
-            emb2d = (P_L @ emb_L_2d) / denom[:, None]
-            emb2d[landmarks] = emb_L_2d
-        elif interp == "laplacian_cg":
-            Wsym = ((P + P.T) * 0.5).astype(np.float32)
-            emb2d = laplacian_cg_interpolate(Wsym, landmarks, emb_L_2d, harmonic_tol, harmonic_max_iter)
-        else:
-            emb2d = harmonic_interpolate(P, landmarks, emb_L_2d,
-                                        max_iter=harmonic_max_iter, tol=harmonic_tol, alpha=1.0, init=None)
-        self.timing.end("interpolation.2d")
-
-        self.timing.start("interpolation.3d")
-        if interp == "barycentric":
-            P_L = P[:, landmarks]
-            denom = (np.array(P_L.sum(axis=1)).ravel() + 1e-12)
-            emb3d = (P_L @ emb_L_3d) / denom[:, None]
-            emb3d[landmarks] = emb_L_3d
-        elif interp == "laplacian_cg":
-            Wsym = ((P + P.T) * 0.5).astype(np.float32)
-            emb3d = laplacian_cg_interpolate(Wsym, landmarks, emb_L_3d, harmonic_tol, harmonic_max_iter)
-        else:
-            emb3d = harmonic_interpolate(P, landmarks, emb_L_3d,
-                                        max_iter=harmonic_max_iter, tol=harmonic_tol, alpha=1.0, init=None)
-        self.timing.end("interpolation.3d")
-
-
-        # ---- results & (optional) node_df update ----
-        res2d = {
-            "mode": "landmark+interpolate",
-            "landmarks": landmarks,
-            "embedding_landmarks": emb_L_2d,
-            "parameters": {
-                "n_neighbors": n_neighbors, "min_dist": min_dist,
-                "interp": interp, "sim_mode": sim_mode,
-                "landmark_ratio": landmark_ratio, "n_landmarks": nL,
-                "min_hops": min_hops
-            }
-        }
-        res3d = {
-            "mode": "landmark+interpolate",
-            "landmarks": landmarks,
-            "embedding_landmarks": emb_L_3d,
-            "parameters": {
-                "n_neighbors": n_neighbors, "min_dist": min_dist,
-                "interp": interp, "sim_mode": sim_mode,
-                "landmark_ratio": landmark_ratio, "n_landmarks": nL,
-                "min_hops": min_hops
-            }
-        }
-
-        if update_node_df and hasattr(graph, 'node_df'):
-            # Write both 2D and 3D (reusing your helper)
-            self.add_umap_to_graph(graph, emb2d, n_components=2)
-            self.add_umap_to_graph(graph, emb3d, n_components=3)
-            if self.verbose:
-                print("  Added UMAP_2D_* and UMAP_3D_* to node_df (landmark-interpolated)")
-
+        
         self.timing.end("create_embeddings_2d_and_3d")
-        return emb2d, res2d, emb3d, res3d
-
+        return embedding_2d, results_2d, embedding_3d, results_3d
+    
     def visualize_components(self, graph, embedding=None, umap_results=None, 
                             max_components=9, fig_size=(15, 12), component_indices=None,
                             alpha=0.7, highlight_alpha=1.0, point_size=5, highlight_size=8,
@@ -2263,8 +1773,6 @@ class DataGraphVisualizer:
             The axes object (for 2D plots only)
         """
         self.timing.start("plot_mst")
-        plt, LineCollection = _load_matplotlib()  # <-- needed for 2D
-        go = _load_plotly()                       # <-- needed for 3D
         
         # Validate dimensionality
         if n_components not in [2, 3]:
