@@ -354,6 +354,46 @@ def boruvka_mst_sequential(n, rows, cols, weights):
 # Keep original version as fallback
 boruvka_mst_parallel = boruvka_mst_parallel_active
 
+@njit
+def _csr_pairs_present(indptr, indices, rows, cols):
+    """
+    For each (rows[k], cols[k]) pair, returns True if the edge exists in the CSR.
+    Assumes CSR is for an undirected graph (we query only (i,j) with i<j).
+    """
+    out = np.zeros(rows.shape[0], dtype=np.bool_)
+    for k in range(rows.shape[0]):
+        i = rows[k]
+        j = cols[k]
+        found = False
+        start = indptr[i]
+        end   = indptr[i+1]
+        for p in range(start, end):
+            if indices[p] == j:
+                found = True
+                break
+        out[k] = found
+    return out
+
+@njit
+def _gather_weights_for_pairs(indptr, indices, data, rows, cols):
+    """
+    For each (rows[k], cols[k]) pair, returns the weight from the CSR (0 if absent).
+    """
+    out = np.zeros(rows.shape[0], dtype=data.dtype)
+    for k in range(rows.shape[0]):
+        i = rows[k]
+        j = cols[k]
+        w = 0.0
+        start = indptr[i]
+        end   = indptr[i+1]
+        for p in range(start, end):
+            if indices[p] == j:
+                w = data[p]
+                break
+        out[k] = w
+    return out
+
+
 @njit(parallel=True)
 def extract_upper_triangle_edges_from_csr_numba(indptr, indices, data, n):
     """
@@ -756,6 +796,7 @@ class DataGraphGenerator:
         """
         # Initialize scale_factor early
         scale_factor = 1.0
+        mst_csr = None  # will hold a symmetric CSR of the MST (unit weights), if computed
         
         self.timing.start("create_knn_graph_with_mst")
         node_df = self.node_df
@@ -1004,7 +1045,6 @@ class DataGraphGenerator:
         dtype = np.float32 if self.use_float32 else np.float64
         graph_distances          = np.zeros(n_edges, dtype=dtype)
         graph_distance_computed  = np.zeros(n_edges, dtype=bool)
-        is_mst_edge              = np.zeros(n_edges, dtype=bool)
         is_valid_edge            = np.ones(n_edges, dtype=bool)
         
         self.timing.end("create_knn_graph_with_mst.initialize_edge_tracking")
@@ -1175,65 +1215,48 @@ class DataGraphGenerator:
                     n
                 )
                 self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.build_hybrid_graph")
-                
-                                    
+
                 # Extract MST from hybrid graph
                 if force_mst:
                     self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
                     mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(hybrid_graph, n)
                     self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.extract_mst")
-                    
-                    # Update MST edge flags efficiently using the returned mask
-                    self.timing.start(f"create_knn_graph_with_mst.iteration_{iteration+1}.identify_mst_edges")
-                    
-                    # Create a mapping from upper triangle edges to the full edge array
-                    # First normalize all edges in edge_arr to ensure i < j
-                    edge_i = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
-                    edge_j = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
-                    
-                    # Build edge to index mapping using a dictionary
-                    edge_to_idx = {(i, j): idx for idx, (i, j) in enumerate(zip(edge_i, edge_j))}
-                    
-                    # Map MST edges to the full edge array
-                    mst_edge_indices = np.where(mst_mask)[0]
-                    for idx in mst_edge_indices:
-                        edge = (mst_rows[idx], mst_cols[idx])
-                        if edge in edge_to_idx:
-                            is_mst_edge[edge_to_idx[edge]] = True
-                    
-                    self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}.identify_mst_edges")
-                    
-                    # Report MST diameters if requested
+
+                    # Build a symmetric CSR for the MST (unit weights; we only need topology later)
+                    mst_i = mst_rows[mst_mask]
+                    mst_j = mst_cols[mst_mask]
+                    mst_w = np.ones(mst_i.shape[0], dtype=np.float32)
+                    this_mst = csr_matrix((mst_w, (mst_i, mst_j)), shape=(n, n))
+                    this_mst = this_mst.maximum(this_mst.T)
+
+                    # Keep the latest MST we computed (typically we only run 1 iteration anyway)
+                    mst_csr = this_mst
+
+                    # (Optional) Diameter reporting for small graphs only (to avoid huge all-pairs)
                     if report_mst_diameters:
-                        # Calculate MST diameter using unscaled graph distances
-                        # Create a graph containing only the MST edges with unscaled graph distances
-                        mst_graph = np.zeros((n, n), dtype=np.float32 if self.use_float32 else np.float64)
-                        mst_edge_count = 0
-                        mst_edge_indices = np.where(is_mst_edge)[0]
-                        for idx in mst_edge_indices:
-                            if graph_distance_computed[idx] and is_valid_edge[idx]:
-                                i, j = edge_arr[idx]
-                                mst_graph[i, j] = graph_distances[idx]  # Use unscaled graph distances
-                                mst_graph[j, i] = graph_distances[idx]
-                                mst_edge_count += 1
-                        
-                        if mst_edge_count > 0:
-                            # Use Floyd-Warshall algorithm to compute all-pairs shortest paths
-                            from scipy.sparse.csgraph import floyd_warshall
-                            dist_matrix = floyd_warshall(csr_matrix(mst_graph))
-                            
-                            # Find the diameter (maximum finite distance)
-                            finite_dists = dist_matrix[np.isfinite(dist_matrix)]
-                            if len(finite_dists) > 0:
-                                diameter = np.max(finite_dists)
-                                print(f"         MST diameter (unscaled graph distances): {diameter:.4g}, with {mst_edge_count} MST edges having graph distances")
-                            else:
-                                print(f"         MST is disconnected or has no finite paths with graph distances")
+                        if n > 100_000:
+                            print("         Skipping MST diameter (n too large for exact APSP).")
                         else:
-                            print(f"         No MST edges have valid graph distances computed")
-                else:
-                    # No MST computation - all edges marked as non-MST
-                    is_mst_edge[:] = False
+                            # Build a weighted MST CSR using hybrid distances directly from hybrid_graph
+                            # (avoid mapping back to edge_arr)
+                            from scipy.sparse import coo_matrix
+                            # Grab weights for the selected edges from hybrid_graph (sparse indexing)
+                            # Note: CSR indexing is OK here since we do it ~n times
+                            vals = np.empty(mst_i.shape[0], dtype=np.float32)
+                            for k in range(mst_i.shape[0]):
+                                vals[k] = hybrid_graph[mst_i[k], mst_j[k]]
+                            mst_wcsr = coo_matrix((vals, (mst_i, mst_j)), shape=(n, n)).tocsr()
+                            mst_wcsr = mst_wcsr.maximum(mst_wcsr.T)
+
+                            from scipy.sparse.csgraph import floyd_warshall
+                            dist_matrix = floyd_warshall(mst_wcsr)
+                            finite = np.isfinite(dist_matrix)
+                            if np.any(finite):
+                                diameter = np.max(dist_matrix[finite])
+                                print(f"         MST diameter (hybrid weights): {diameter:.4g}")
+                            else:
+                                print("         MST diameter unavailable (no finite paths).")
+
                 
                 self.timing.end(f"create_knn_graph_with_mst.iteration_{iteration+1}")
         
@@ -1253,15 +1276,21 @@ class DataGraphGenerator:
         self.timing.end("create_knn_graph_with_mst.final_verification")
         
         if self.verbose:
-            valid_edge_count = np.sum(is_valid_edge)
-            mst_edge_count = np.sum(is_mst_edge)
+            valid_edge_count = int(np.sum(is_valid_edge))
+            if force_mst and (mst_csr is not None):
+                # mst_csr is symmetric; undirected edge count ~ nnz/2
+                mst_edge_count = mst_csr.nnz // 2
+            else:
+                mst_edge_count = 0
+
             print(f"         Combined graph has {valid_edge_count} valid edges (of {len(edge_arr)} total), "
-                  f"including {mst_edge_count} MST edges")
+                f"including {mst_edge_count} MST edges")
             if is_final_connected:
                 print(f"         Final graph is connected")
             else:
                 n_components_final, _ = connected_components(final_graph, directed=False)
                 print(f"         WARNING: Final graph has {n_components_final} connected components!")
+
         
         self.timing.end("create_knn_graph_with_mst")
         
@@ -1270,7 +1299,6 @@ class DataGraphGenerator:
         filtered_edge_arr = edge_arr[valid_indices]
         filtered_graph_distances = graph_distances[valid_indices]
         filtered_euclidean_distances = euclidean_distances_list[valid_indices]
-        filtered_is_mst_edge = is_mst_edge[valid_indices]
         
         # Compute final statistics if we have data
         graph_distance_stats = None
@@ -1307,234 +1335,122 @@ class DataGraphGenerator:
             'edge_arr': filtered_edge_arr,  # Now returning array instead of list
             'graph_distances': filtered_graph_distances,
             'euclidean_distances': filtered_euclidean_distances,
-            'is_mst_edge': filtered_is_mst_edge,
             'graph_distance_scalar': scale_factor,
             # Add statistics to the returned data
             'graph_distance_stats': graph_distance_stats,
             'euclidean_stats': euclidean_stats,
             'n_removed_edges': len(edge_arr) - len(filtered_edge_arr),  # Track removed edges
             'use_euclidean_as_graph_distance': self.use_euclidean_as_graph_distance,
-            'mst_computed': force_mst
+            'mst_computed': bool(force_mst and (mst_csr is not None)),
+            'mst_csr': mst_csr,
         }
     
     def prune_graph_by_threshold(self, graph, edge_data, threshold=None, kneedle_sensitivity=1.0, 
-                               max_components=None, use_median_filter=True, preserve_mst=True):
+                             max_components=None, use_median_filter=True, preserve_mst=True):
         """
         Prune a graph by removing edges with distances above a threshold.
-        Now uses in-place edge removal (B.6 optimization) and direct MST mask.
-        
-        NOTE: Edges that exceed the threshold are already removed during computation,
-        so this method primarily handles automatic threshold detection and additional pruning.
-        
-        Parameters:
-        -----------
-        graph : scipy.sparse.csr_matrix
-            Graph with edge weights
-        edge_data : dict
-            Dictionary with edge arrays and distances
-        threshold : float, optional
-            Distance threshold for pruning edges. If None, determined automatically.
-        kneedle_sensitivity : float, default=1.0
-            Sensitivity for kneedle algorithm if using automatic threshold
-        max_components : int, optional
-            Maximum number of connected components allowed after pruning.
-            If pruning would exceed this, adjust the threshold to maintain connectivity.
-        use_median_filter : bool, default=True
-            If True, only consider edges above the median distance for knee point detection
-        preserve_mst : bool, default=True
-            If True, preserve all edges in the minimum spanning tree to maintain connectivity
-            
-        Returns:
-        --------
-        scipy.sparse.csr_matrix
-            Pruned graph
-        dict
-            Updated edge data
-        dict
-            Additional results including pruned edges and threshold
+
+        Now:
+        • Uses saved MST topology (edge_data['mst_csr']) if available.
+        • Avoids per-edge Python dict lookups and O(E) set membership.
+        • Computes indices-to-remove directly from the sorted index vector.
+        • If MST edges get pruned by threshold, we re-add ONLY the missing
+            MST edges afterward with their original weights from `graph`.
         """
         self.timing.start("prune_graph_by_threshold")
-        
+
         n = graph.shape[0]
-        edge_arr = edge_data['edge_arr']  # Now using array
-        graph_distances = edge_data['graph_distances']
-        
-        # OPTIMIZATION: Early return if no pruning needed
-        # Case 1: Threshold is infinity
+        edge_arr         = edge_data['edge_arr']          # (E, 2) upper-tri
+        graph_distances  = edge_data['graph_distances']   # (E,)
+
+        # Fast-path: nothing to do if threshold is +inf
         if threshold == np.inf:
             if self.verbose:
                 print(f"[Pruning] No pruning needed: threshold is infinity")
-            
             self.timing.end("prune_graph_by_threshold")
             return graph, edge_data, {
                 'pruned_edges': np.array([], dtype=np.int32).reshape(0, 2),
                 'pruned_distances': np.array([]),
                 'threshold': threshold
             }
-        
-        # Case 2: Threshold exceeds max distance
+
+        # Fast-path: threshold >= max distance
         max_dist = None
         if 'graph_distance_stats' in edge_data and edge_data['graph_distance_stats'] is not None:
-            # Use precomputed statistics if available
             max_dist = edge_data['graph_distance_stats']['max']
         elif graph_distances.size > 0:
-            # Otherwise compute it directly
             max_dist = graph_distances.max()
-            
+
         if threshold is not None and max_dist is not None and threshold >= max_dist:
             if self.verbose:
                 print(f"[Pruning] No pruning needed: threshold {threshold:.4g} >= max distance {max_dist:.4g}")
-            
             self.timing.end("prune_graph_by_threshold")
             return graph, edge_data, {
                 'pruned_edges': np.array([], dtype=np.int32).reshape(0, 2),
                 'pruned_distances': np.array([]),
                 'threshold': threshold
             }
-        
+
         if self.verbose:
             print(f"[Pruning] Pruning graph edges by threshold")
-        
-        # If we're preserving the MST, get the MST edge mask
+
+        # === Prepare MST topology (if requested and available) ===
         self.timing.start("prune_graph_by_threshold.prepare_mst")
-        mst_edge_mask = None
+        mst_topology = None
         if preserve_mst:
-            if threshold is not None:
-                # 1) Build mask of edges to keep
-                keep_mask = graph_distances <= threshold
-        
-                # 2) Build the pruned graph once
-                pruned = self.build_graph_from_edges_memory_efficient(
-                    edge_arr, graph_distances, keep_mask, graph.shape[0]
-                )
-        
-                # 3) Check connectivity
-                if check_graph_connectivity(pruned):
-                    if self.verbose:
-                        print("         Pruned graph stays connected—no MST edges lost")
-                    # Use existing MST edge information if available
-                    if edge_data.get('mst_computed') and 'is_mst_edge' in edge_data:
-                        mst_edge_mask = edge_data['is_mst_edge']
-                else:
-                    if self.verbose:
-                        print("         Pruned graph is disconnected—recomputing MST")
-                    # Compute MST and get the boolean mask directly
-                    mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(graph, n)
-                    
-                    # Map MST mask to edge_arr indices
-                    edge_i = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
-                    edge_j = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
-                    edge_to_idx = {(i, j): idx for idx, (i, j) in enumerate(zip(edge_i, edge_j))}
-                    
-                    mst_edge_mask = np.zeros(len(edge_arr), dtype=bool)
-                    mst_edge_indices = np.where(mst_mask)[0]
-                    for idx in mst_edge_indices:
-                        edge = (mst_rows[idx], mst_cols[idx])
-                        if edge in edge_to_idx:
-                            mst_edge_mask[edge_to_idx[edge]] = True
-        
+            mst_topology = edge_data.get('mst_csr', None)
+            if mst_topology is not None:
+                if self.verbose:
+                    print(f"         Preserving MST topology with {mst_topology.nnz // 2} edges to maintain connectivity")
             else:
-                # No threshold ⇒ automatic pruning; always ensure MST
-                if edge_data.get('mst_computed') and 'is_mst_edge' in edge_data:
-                    mst_edge_mask = edge_data['is_mst_edge']
-                    if self.verbose:
-                        print(f"         Using precomputed MST ({np.sum(mst_edge_mask)} edges)")
-                else:
-                    if self.verbose:
-                        print("         Computing MST edges for automatic threshold pruning")
-                    # Compute MST and get the boolean mask directly
-                    mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(graph, n)
-                    
-                    # Map MST mask to edge_arr indices
-                    edge_i = np.minimum(edge_arr[:, 0], edge_arr[:, 1])
-                    edge_j = np.maximum(edge_arr[:, 0], edge_arr[:, 1])
-                    edge_to_idx = {(i, j): idx for idx, (i, j) in enumerate(zip(edge_i, edge_j))}
-                    
-                    mst_edge_mask = np.zeros(len(edge_arr), dtype=bool)
-                    mst_edge_indices = np.where(mst_mask)[0]
-                    for idx in mst_edge_indices:
-                        edge = (mst_rows[idx], mst_cols[idx])
-                        if edge in edge_to_idx:
-                            mst_edge_mask[edge_to_idx[edge]] = True
-        
-            if self.verbose and mst_edge_mask is not None:
-                print(f"         Preserving {np.sum(mst_edge_mask)} MST edges to maintain connectivity")
-        else:
-            if self.verbose:
-                print("         MST preservation disabled—pruning without connectivity guarantee")
-                
+                if self.verbose:
+                    print("         No saved MST topology found; pruning without explicit MST preservation")
         self.timing.end("prune_graph_by_threshold.prepare_mst")
-        
-        # Check if we have cached sorted edges
-        graph_id = id(graph)
+
+        # === Get or build a cached descending sort of all edges by distance ===
+        graph_id  = id(graph)
         cache_key = (graph_id, 'sorted')
-        
         if cache_key in self._sorted_edge_cache:
-            sorted_indices = self._sorted_edge_cache[cache_key]['indices']
-            sorted_edges = self._sorted_edge_cache[cache_key]['edges']
+            sorted_indices   = self._sorted_edge_cache[cache_key]['indices']
             sorted_distances = self._sorted_edge_cache[cache_key]['distances']
         else:
-            # Sort edges by distance (in descending order)
             self.timing.start("prune_graph_by_threshold.sort_edges")
-            sorted_indices = np.argsort(graph_distances)[::-1]
-            sorted_edges = edge_arr[sorted_indices]  # Direct array indexing
+            sorted_indices   = np.argsort(graph_distances)[::-1]   # descending
             sorted_distances = graph_distances[sorted_indices]
-            
-            # Cache the sorted data
+            # (we don't cache sorted_edges array itself; it duplicates edge_arr)
             self._sorted_edge_cache[cache_key] = {
-                'indices': sorted_indices,
-                'edges': sorted_edges,
+                'indices':   sorted_indices,
                 'distances': sorted_distances
             }
             self.timing.end("prune_graph_by_threshold.sort_edges")
-        
+
         if self.verbose:
-            # Use precomputed statistics if available
             if 'graph_distance_stats' in edge_data and edge_data['graph_distance_stats'] is not None:
                 stats = edge_data['graph_distance_stats']
                 print(f"         Edge distance stats: min={stats['min']:.4g}, "
-                      f"mean={stats['mean']:.4g}, max={stats['max']:.4g}")
+                    f"mean={stats['mean']:.4g}, max={stats['max']:.4g}")
             else:
                 print(f"         Edge distance stats: min={graph_distances.min():.4g}, "
-                      f"mean={graph_distances.mean():.4g}, max={graph_distances.max():.4g}")
-                
-            # Use standard median calculation
+                    f"mean={graph_distances.mean():.4g}, max={graph_distances.max():.4g}")
             median_graph = np.median(graph_distances)
             print(f"         Median distance: {median_graph:.4g}")
-        
-        # Filter out MST edges from consideration for pruning
-        self.timing.start("prune_graph_by_threshold.filter_prunable")
-        if preserve_mst and mst_edge_mask is not None:
-            # Use the boolean mask directly
-            sorted_mst_mask = mst_edge_mask[sorted_indices]
-            prunable_mask = ~sorted_mst_mask
-            prunable_edges = sorted_edges[prunable_mask]
-            prunable_distances = sorted_distances[prunable_mask]
-            
-            if self.verbose:
-                print(f"         {len(prunable_edges)} edges are candidates for pruning "
-                      f"(non-MST edges)")
-        else:
-            prunable_edges = sorted_edges
-            prunable_distances = sorted_distances
-        self.timing.end("prune_graph_by_threshold.filter_prunable")
-        
-        # Determine which edges to prune
+
+        # === Decide edges to prune via indices (no Python sets / dicts) ===
         self.timing.start("prune_graph_by_threshold.determine_edges")
         if threshold is not None:
-            # Prune edges above the provided threshold
-            edges_to_prune_mask = prunable_distances > threshold
-            edges_to_prune = prunable_edges[edges_to_prune_mask]
-            prune_distances = prunable_distances[edges_to_prune_mask]
-            
+            # remove all sorted_indices with distance > threshold
+            remove_mask_sorted  = (sorted_distances > threshold)
+            remove_sorted_idx   = sorted_indices[remove_mask_sorted]
+            edges_to_prune      = edge_arr[remove_sorted_idx]
+            prune_distances     = graph_distances[remove_sorted_idx]
+
             if self.verbose:
-                print(f"         Pruning {len(edges_to_prune)} edges above threshold {threshold:.4g}")
-        
+                print(f"         Pruning {len(remove_sorted_idx)} edges above threshold {threshold:.4g}")
         else:
-            if len(prunable_edges) < 2:
+            # Kneedle on the DESC-sorted distances
+            if len(sorted_distances) < 2:
                 if self.verbose:
-                    print(f"         Not enough prunable edges. Skipping pruning.")
-                
+                    print(f"         Not enough edges to determine knee; skipping pruning.")
                 self.timing.end("prune_graph_by_threshold.determine_edges")
                 self.timing.end("prune_graph_by_threshold")
                 return graph, edge_data, {
@@ -1542,149 +1458,125 @@ class DataGraphGenerator:
                     'pruned_distances': np.array([]),
                     'threshold': None
                 }
-            
-            # Use kneedle algorithm to find the optimal threshold
-            knee_idx = find_knee_point(np.arange(len(prunable_distances)), prunable_distances, 
-                                      S=kneedle_sensitivity, use_median_filter=use_median_filter)
-            threshold = prunable_distances[knee_idx]
-            edges_to_prune = prunable_edges[:knee_idx+1]
-            prune_distances = prunable_distances[:knee_idx+1]
-            
+
+            knee_idx = find_knee_point(np.arange(len(sorted_distances)), sorted_distances,
+                                    S=kneedle_sensitivity, use_median_filter=use_median_filter)
+            threshold         = sorted_distances[knee_idx]
+            remove_sorted_idx = sorted_indices[:knee_idx+1]
+            edges_to_prune    = edge_arr[remove_sorted_idx]
+            prune_distances   = graph_distances[remove_sorted_idx]
+
             if self.verbose:
                 print(f"         Kneedle algorithm: found threshold at {threshold:.4g} "
-                      f"(index {knee_idx}/{len(prunable_distances)})")
-                print(f"         Pruning {len(edges_to_prune)} edges above threshold")
-            
-            # Optionally plot the knee point
-            if self.plot_knee:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(10, 6))
-                plt.plot(np.arange(len(prunable_distances)), prunable_distances, 'b-', linewidth=2)
-                plt.axvline(x=knee_idx, color='r', linestyle='--', 
-                          label=f'Knee point: {threshold:.4g}')
-                plt.axhline(y=np.median(prunable_distances), color='g', linestyle=':', 
-                          label=f'Median: {np.median(prunable_distances):.4g}')
-                plt.xlabel('Sorted Edge Index')
-                plt.ylabel('Graph Distance')
-                plt.title('Knee Point Detection for Graph Pruning')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                plt.tight_layout()
-                plt.savefig('graph_knee_point_detection.png', dpi=300)
-                plt.close()
-                print(f"         Knee point visualization saved to 'graph_knee_point_detection.png'")
+                    f"(index {knee_idx}/{len(sorted_distances)})")
+                print(f"         Pruning {len(remove_sorted_idx)} edges above threshold")
         self.timing.end("prune_graph_by_threshold.determine_edges")
-        
-        # If max_components is specified, ensure we don't create too many components
-        if max_components is not None and not preserve_mst:
+
+        # === Optional: honor max_components (only when we are NOT force-preserving MST) ===
+        if max_components is not None and not preserve_mst and len(remove_sorted_idx) > 0:
             self.timing.start("prune_graph_by_threshold.check_components")
-            # Use in-place edge removal (B.6 optimization)
             test_graph = graph.copy()
-            
-            # Try removing edges one by one, from highest to lowest distance
-            current_components = 1  # Assume we start with a connected graph
-            
-            for i, edge in enumerate(edges_to_prune):
-                # Remove the edge in-place
-                test_graph[edge[0], edge[1]] = 0
-                test_graph[edge[1], edge[0]] = 0
-                
-                # Check if we've reached the component limit (do this every few edges for efficiency)
-                if i % 100 == 0 or i == len(edges_to_prune) - 1:
-                    test_graph.eliminate_zeros()  # Clean up zeros
-                    n_components, _ = connected_components(test_graph, directed=False)
-                    
-                    if n_components > max_components:
-                        # We've created too many components, revert to the previous threshold
+            for i, eidx in enumerate(remove_sorted_idx):
+                u, v = edge_arr[eidx]
+                test_graph[u, v] = 0
+                test_graph[v, u] = 0
+                if i % 100 == 0 or i == len(remove_sorted_idx) - 1:
+                    test_graph.eliminate_zeros()
+                    comps, _ = connected_components(test_graph, directed=False)
+                    if comps > max_components:
+                        # back off one step
                         if i > 0:
-                            threshold = prunable_distances[i-1]
-                            edges_to_prune = edges_to_prune[:i]
-                            prune_distances = prune_distances[:i]
+                            remove_sorted_idx = remove_sorted_idx[:i]
+                            edges_to_prune    = edge_arr[remove_sorted_idx]
+                            prune_distances   = graph_distances[remove_sorted_idx]
+                            threshold         = prune_distances[-1]
                         else:
-                            # Don't prune any edges if even the first one creates too many components
-                            threshold = prunable_distances[0] + 1e-6
-                            edges_to_prune = np.array([], dtype=edges_to_prune.dtype).reshape(0, 2)
-                            prune_distances = np.array([])
-                        
+                            remove_sorted_idx = remove_sorted_idx[:0]
+                            edges_to_prune    = edges_to_prune[:0]
+                            prune_distances   = prune_distances[:0]
+                            threshold         = threshold + 1e-6
                         if self.verbose:
                             print(f"         Limiting pruning to maintain max {max_components} components")
-                            print(f"         Adjusted threshold: {threshold:.4g}, pruning {len(edges_to_prune)} edges")
-                        
+                            print(f"         Adjusted threshold: {threshold:.4g}, pruning {len(remove_sorted_idx)} edges")
                         break
-                    
-                    current_components = n_components
             self.timing.end("prune_graph_by_threshold.check_components")
-        
-        # Apply pruning using optimized in-place modification
+
+        # === Apply pruning efficiently via a boolean keep-mask over indices ===
         self.timing.start("prune_graph_by_threshold.apply_pruning")
-        
-        # Create a mask for edges to keep
-        edges_to_remove_set = set(map(tuple, edges_to_prune))
-        keep_mask = np.array([tuple(edge) not in edges_to_remove_set for edge in edge_arr])
-        
-        # Build pruned graph directly with the keep mask
+        keep_mask = np.ones(edge_arr.shape[0], dtype=bool)
+        if len(remove_sorted_idx) > 0:
+            keep_mask[remove_sorted_idx] = False
+
         pruned_graph = self.build_graph_from_edges_memory_efficient(
             edge_arr, graph_distances, keep_mask, n
         )
-        
         self.timing.end("prune_graph_by_threshold.apply_pruning")
-        
-        # Create new edge data for the pruned graph more efficiently
+
+        # === Re-add any missing MST edges (with original weights) ===
+        self.timing.start("prune_graph_by_threshold.restore_mst")
+        restored_edges = 0
+        if preserve_mst and (mst_topology is not None):
+            # Extract MST edge list (upper-tri)
+            mst_rows, mst_cols, _ = extract_upper_triangle_edges_from_csr(mst_topology)
+
+            # Which of those are missing in the pruned graph?
+            present_mask = _csr_pairs_present(pruned_graph.indptr, pruned_graph.indices, mst_rows, mst_cols)
+            missing_rows = mst_rows[~present_mask]
+            missing_cols = mst_cols[~present_mask]
+
+            if missing_rows.size > 0:
+                # Gather weights from the ORIGINAL graph (pre-pruning)
+                w = _gather_weights_for_pairs(graph.indptr, graph.indices, graph.data, missing_rows, missing_cols)
+
+                # Build a symmetric patch CSR and union with pruned_graph
+                k = missing_rows.shape[0]
+                patch_rows = np.empty(2 * k, dtype=np.int32)
+                patch_cols = np.empty(2 * k, dtype=np.int32)
+                patch_data = np.repeat(w, 2).astype(graph.data.dtype, copy=False)
+
+                patch_rows[0::2] = missing_rows
+                patch_rows[1::2] = missing_cols
+                patch_cols[0::2] = missing_cols
+                patch_cols[1::2] = missing_rows
+
+                patch = self._build_csr_from_edge_arrays(patch_rows, patch_cols, patch_data, n)
+
+                # Take element-wise max to insert the (previous) weights for missing edges
+                pruned_graph = pruned_graph.maximum(patch)
+                restored_edges = k
+
+            if self.verbose:
+                kept = (mst_rows.size - restored_edges)
+                print(f"         Preserved MST edges: {kept} already kept, {restored_edges} restored")
+        self.timing.end("prune_graph_by_threshold.restore_mst")
+
+        # === Create pruned edge data ===
         self.timing.start("prune_graph_by_threshold.create_edge_data")
-        
-        # Extract edges directly from CSR without converting to COO
         pruned_edge_arr, pruned_weights = extract_all_edges_from_csr(pruned_graph, upper_only=True)
-        
-        # Preserve MST edge information if available
-        if 'is_mst_edge' in edge_data:
-            # Create a mapping of edges to MST status from original data
-            original_mst_map = {}
-            for idx, edge in enumerate(edge_arr):
-                original_mst_map[tuple(edge)] = edge_data['is_mst_edge'][idx]
-            
-            # Map to new edges
-            pruned_is_mst_edge = np.array([
-                original_mst_map.get(tuple(edge), False)
-                for edge in pruned_edge_arr
-            ])
-        else:
-            pruned_is_mst_edge = None
-        
-        # Create updated statistics for the pruned graph
+
         pruned_graph_distance_stats = None
-        if len(pruned_weights) > 0:
+        if pruned_weights.size > 0:
             pruned_graph_distance_stats = {
-                'mean': np.mean(pruned_weights),
-                'std': np.std(pruned_weights),
-                'min': np.min(pruned_weights),
-                'max': np.max(pruned_weights),
-                'count': len(pruned_weights)
+                'mean': float(np.mean(pruned_weights)),
+                'std':  float(np.std(pruned_weights)),
+                'min':  float(np.min(pruned_weights)),
+                'max':  float(np.max(pruned_weights)),
+                'count': int(pruned_weights.size)
             }
-        
+
         pruned_edge_data = {
-            'edge_arr': pruned_edge_arr,  # Now storing as array
-            'graph_distances': pruned_weights
+            'edge_arr': pruned_edge_arr,
+            'graph_distances': pruned_weights,
+            # propagate useful stats/flags
+            'graph_distance_stats': pruned_graph_distance_stats,
+            'euclidean_stats': edge_data.get('euclidean_stats'),
+            'use_euclidean_as_graph_distance': edge_data.get('use_euclidean_as_graph_distance', False),
+            'mst_computed': bool(mst_topology is not None),
+            'mst_csr': mst_topology,   # keep the topology for future rounds
         }
-        
-        # Add MST edge information if it was available
-        if pruned_is_mst_edge is not None:
-            pruned_edge_data['is_mst_edge'] = pruned_is_mst_edge
-        
-        # Add statistics if we calculated them
-        if pruned_graph_distance_stats is not None:
-            pruned_edge_data['graph_distance_stats'] = pruned_graph_distance_stats
-        
-        # Copy over other statistics if they were available
-        if 'euclidean_stats' in edge_data:
-            pruned_edge_data['euclidean_stats'] = edge_data['euclidean_stats']
-            
-        # Copy over optimization flag
-        if 'use_euclidean_as_graph_distance' in edge_data:
-            pruned_edge_data['use_euclidean_as_graph_distance'] = edge_data['use_euclidean_as_graph_distance']
-            
         self.timing.end("prune_graph_by_threshold.create_edge_data")
-        
-        # Verify the pruned graph
+
+        # === Verify ===
         self.timing.start("prune_graph_by_threshold.verify")
         if self.verbose:
             is_pruned_connected = check_graph_connectivity(pruned_graph)
@@ -1692,18 +1584,20 @@ class DataGraphGenerator:
             if is_pruned_connected:
                 print(f"         Pruned graph is connected")
             else:
-                n_components, _ = connected_components(pruned_graph, directed=False)
-                print(f"         Pruned graph has {n_components} connected components")
-            
-            # Verify that all MST edges are still present
-            if 'is_mst_edge' in pruned_edge_data and preserve_mst:
-                mst_edge_count = np.sum(pruned_edge_data['is_mst_edge'])
-                expected_mst_edges = n - 1
-                if mst_edge_count != expected_mst_edges:
-                    print(f"         WARNING: After pruning, found {mst_edge_count} MST edges, expected {expected_mst_edges}")
+                comps, _ = connected_components(pruned_graph, directed=False)
+                print(f"         Pruned graph has {comps} connected components")
+
+            if preserve_mst and (mst_topology is not None):
+                # Ensure all MST edges exist
+                mst_rows, mst_cols, _ = extract_upper_triangle_edges_from_csr(mst_topology)
+                present_mask = _csr_pairs_present(pruned_graph.indptr, pruned_graph.indices, mst_rows, mst_cols)
+                missing_count = int((~present_mask).sum())
+                expected_mst_edges = mst_topology.nnz // 2
+                if missing_count > 0:
+                    print(f"         WARNING: {missing_count}/{expected_mst_edges} MST edges still missing after restoration")
         self.timing.end("prune_graph_by_threshold.verify")
+
         self.timing.end("prune_graph_by_threshold")
-        
         return pruned_graph, pruned_edge_data, {
             'pruned_edges': edges_to_prune,
             'pruned_distances': prune_distances,
@@ -1711,164 +1605,139 @@ class DataGraphGenerator:
         }
 
     def smooth_graph_with_2hop(self, graph, edge_data, node_df, premetric_weight_function, 
-                              max_new_edges=None, batch_size=None):
+                           max_new_edges=None, batch_size=None):
         """
         Smooth the graph by adding connections between 2-hop neighbors.
-        
-        NOTE: New edges that have missing values (self.missing_weight) are not added.
-        
-        Parameters:
-        -----------
-        graph : scipy.sparse.csr_matrix
-            Current graph
-        edge_data : dict
-            Dictionary with edge arrays and distances
-        max_new_edges : int, optional
-            Maximum number of new edges to add. If None, add all valid 2-hop connections.
-        batch_size : int, default=automatic
-            Batch size for computing graph distances
-            
-        Returns:
-        --------
-        scipy.sparse.csr_matrix
-            Smoothed graph with new edges
-        dict
-            Updated edge data
-        dict
-            Additional results
+
+        IMPORTANT:
+        • Does NOT touch MST bookkeeping. We simply pass through the saved
+            topology `edge_data['mst_csr']` (if any).
+        • New edges with missing values (self.missing_weight) are skipped.
+        • Uses CSR presence checks to avoid building a huge Python set of edges.
         """
         self.timing.start("smooth_graph_with_2hop")
-        
+
         if self.verbose:
             print(f"[Smoothing] Adding connections between 2-hop neighbors")
-        
+
         n = graph.shape[0]
-        edge_arr = edge_data['edge_arr']  # Now using array
+        edge_arr = edge_data['edge_arr']
         graph_distances = edge_data['graph_distances']
-        
-        # Check if using Euclidean optimization
+
+        # Whether we're in Euclidean optimization mode
         use_euclidean = edge_data.get('use_euclidean_as_graph_distance', False)
-        
-        # Create a set of existing edges for fast lookup
-        existing_edges = set(map(tuple, edge_arr))
-        
-        # Find 2-hop neighbors using sparse matrix operations
+
+        # Find 2-hop neighbors with sparse ops
         self.timing.start("smooth_graph_with_2hop.find_2hop")
-        new_edge_arr = find_2hop_neighbors_sparse(graph)
-        
-        # Filter out existing edges
-        new_edges_mask = np.array([
-            tuple(edge) not in existing_edges 
-            for edge in new_edge_arr
-        ])
-        new_edge_arr = new_edge_arr[new_edges_mask]
+        new_edge_arr = find_2hop_neighbors_sparse(graph)  # (M,2) upper-tri
+        # Filter out edges that are already present in CSR (avoid building a huge Python set)
+        if new_edge_arr.shape[0] > 0:
+            present_mask = _csr_pairs_present(
+                graph.indptr, graph.indices,
+                new_edge_arr[:, 0], new_edge_arr[:, 1]
+            )
+            new_edge_arr = new_edge_arr[~present_mask]
         self.timing.end("smooth_graph_with_2hop.find_2hop")
-        
+
+        # Optional cap
         if max_new_edges is not None and len(new_edge_arr) > max_new_edges:
             if self.verbose:
                 print(f"         Found {len(new_edge_arr)} potential 2-hop connections, limiting to {max_new_edges}")
-            # Randomly sample a subset of new edges
-            random_indices = np.random.choice(len(new_edge_arr), max_new_edges, replace=False)
-            new_edge_arr = new_edge_arr[random_indices]
-        
+            sel = np.random.choice(len(new_edge_arr), max_new_edges, replace=False)
+            new_edge_arr = new_edge_arr[sel]
+
         if self.verbose:
             print(f"         Adding up to {len(new_edge_arr)} new 2-hop connections")
-        
-        # If no new edges, return early
-        if len(new_edge_arr) == 0:
+
+        # Early out if nothing to add
+        if new_edge_arr.shape[0] == 0:
             if self.verbose:
                 print(f"         No new 2-hop connections to add")
-            
             self.timing.end("smooth_graph_with_2hop")
             return graph, edge_data, {
                 'n_new_edges': 0,
                 'new_edges': np.array([], dtype=np.int32).reshape(0, 2),
-                'new_distances': np.array([])
+                'new_distances': np.array([]),
+                'n_removed': 0
             }
-        
+
         new_i = new_edge_arr[:, 0]
         new_j = new_edge_arr[:, 1]
-        
-        # Compute graph distances for new edges in batches
+
+        # Prepare to compute distances for the new edges
         valid_new_edges = []
         new_edge_distances = []
-        
-        # If using Euclidean optimization, compute embeddings once
+
+        # If using Euclidean optimization, build embeddings once (vectorized if available)
         if use_euclidean:
             if self.verbose:
                 print(f"         Using Euclidean distances for 2-hop edges (optimization mode)")
-            embeddings = np.array(node_df.apply(self.embedding_function, axis=1).tolist())
-            if self.use_float32:
-                embeddings = embeddings.astype(np.float32)
-        
-        # Process in batches to reduce memory pressure
-        self.timing.start("smooth_graph_with_2hop.compute_distances")
-        n_items = len(new_i)
-        if batch_size is None:
-            # Estimate based on dataframe size
-            batch_size = min(100000, n_items)
-                    
-        n_batches = (len(new_edge_arr) - 1) // batch_size + 1
-        if self.verbose and len(new_edge_arr) > batch_size:
-            print(f"         Processing in {n_batches} batches of size {batch_size}")
-        
-        removed_count = 0  # Track edges with missing values
-        
-        # Get the batcher lazily
-        batcher = self._get_batcher() if not use_euclidean else None
-        
-        for batch_idx in range(0, len(new_edge_arr), batch_size):
-            if self.verbose and len(new_edge_arr) > batch_size and batch_idx % (10 * batch_size) == 0:
-                print(f"         Processing batch {batch_idx//batch_size + 1}/{n_batches}")
-                
-            end_idx = min(batch_idx + batch_size, len(new_edge_arr))
-            batch_i = new_i[batch_idx:end_idx]
-            batch_j = new_j[batch_idx:end_idx]
-            batch_edges = new_edge_arr[batch_idx:end_idx]
-            
-            if use_euclidean:
-                # Compute Euclidean distances directly (vectorized)
-                batch_distances = np.linalg.norm(
-                    embeddings[batch_i] - embeddings[batch_j], 
-                    axis=1
-                )
+            emb_vec = getattr(self, "embedding_vectorizer", None)
+            if callable(emb_vec):
+                embeddings = emb_vec(node_df)
             else:
-                # Compute distances for this batch using the custom function
-                batch_distances = batcher(
-                    self.node_features, batch_i, batch_j
-                )
-            
-            # Filter out edges with missing values
-            valid_mask = batch_distances != self.missing_weight
-            valid_batch_edges = batch_edges[valid_mask]
-            valid_batch_distances = batch_distances[valid_mask]
-            
-            removed_count += np.sum(~valid_mask)
-            
-            # Add valid edges to results
-            if len(valid_batch_edges) > 0:
-                valid_new_edges.extend(valid_batch_edges)
-                new_edge_distances.extend(valid_batch_distances)
-                    
+                try:
+                    import swifter
+                    swifter.set_defaults(progress_bar=False, verbose=True)
+                    embeddings = np.array(node_df.swifter.apply(self.embedding_function, axis=1).tolist())
+                except Exception:
+                    embeddings = np.array(node_df.apply(self.embedding_function, axis=1).tolist())
+            if self.use_float32:
+                embeddings = embeddings.astype(np.float32, copy=False)
+
+        # Batch compute distances
+        self.timing.start("smooth_graph_with_2hop.compute_distances")
+        n_items = len(new_edge_arr)
+        if batch_size is None:
+            batch_size = min(100000, n_items)
+        n_batches = (n_items - 1) // batch_size + 1
+        if self.verbose and n_items > batch_size:
+            print(f"         Processing in {n_batches} batches of size {batch_size}")
+
+        removed_count = 0
+        batcher = self._get_batcher() if not use_euclidean else None
+
+        for start in range(0, n_items, batch_size):
+            if self.verbose and n_items > batch_size and start % (10 * batch_size) == 0:
+                print(f"         Processing batch {start//batch_size + 1}/{n_batches}")
+
+            end = min(start + batch_size, n_items)
+            bi = new_i[start:end]
+            bj = new_j[start:end]
+            bedges = new_edge_arr[start:end]
+
+            if use_euclidean:
+                bd = np.linalg.norm(embeddings[bi] - embeddings[bj], axis=1)
+            else:
+                bd = batcher(self.node_features, bi, bj)
+
+            # Filter out missing edges
+            valid_mask = (bd != self.missing_weight)
+            removed_count += int((~valid_mask).sum())
+
+            if valid_mask.any():
+                valid_new_edges.append(bedges[valid_mask])
+                new_edge_distances.append(bd[valid_mask])
+
         self.timing.end("smooth_graph_with_2hop.compute_distances")
-        
-        # Convert to arrays
+
+        # Consolidate new edges
         if len(valid_new_edges) > 0:
-            valid_new_edges = np.array(valid_new_edges, dtype=np.int32)
-            new_edge_distances = np.array(new_edge_distances)
+            valid_new_edges = np.vstack(valid_new_edges).astype(np.int32, copy=False)
+            new_edge_distances = np.concatenate(new_edge_distances, axis=0)
         else:
             valid_new_edges = np.array([], dtype=np.int32).reshape(0, 2)
-            new_edge_distances = np.array([])
-        
+            new_edge_distances = np.array([], dtype=graph_distances.dtype)
+
         if removed_count > 0 and self.verbose:
             print(f"         Skipped {removed_count} 2-hop edges with missing values")
+        if self.verbose:
             print(f"         Adding {len(valid_new_edges)} valid new edges")
-        
-        # If no valid edges remain, return early
-        if len(valid_new_edges) == 0:
+
+        # Early out if nothing valid remains
+        if valid_new_edges.shape[0] == 0:
             if self.verbose:
                 print(f"         No valid 2-hop connections to add after filtering")
-            
             self.timing.end("smooth_graph_with_2hop")
             return graph, edge_data, {
                 'n_new_edges': 0,
@@ -1876,74 +1745,45 @@ class DataGraphGenerator:
                 'new_distances': new_edge_distances,
                 'n_removed': removed_count
             }
-        
-        # Add new edges to the graph more efficiently
-        self.timing.start("smooth_graph_with_2hop.add_edges")
 
-        # Build a new graph with all edges combined
+        # Build a new graph with existing + new edges
+        self.timing.start("smooth_graph_with_2hop.add_edges")
         all_edges = np.vstack([edge_arr, valid_new_edges])
         all_distances = np.concatenate([graph_distances, new_edge_distances])
-        
         smoothed_graph = self.build_graph_from_edges_memory_efficient(
-            all_edges, all_distances, np.ones(len(all_edges), dtype=bool), n
+            all_edges, all_distances, np.ones(all_edges.shape[0], dtype=bool), n
         )
-        
         self.timing.end("smooth_graph_with_2hop.add_edges")
 
-        # Update edge data
+        # Update edge_data (NO MST BOOKKEEPING — pass `mst_csr` through unchanged)
         self.timing.start("smooth_graph_with_2hop.update_edge_data")
-        has_mst_info = 'is_mst_edge' in edge_data
-        
-        # Get the MST edges for this graph if we have MST info
-        if has_mst_info:
-            # Use existing MST information from edge_data
-            original_mst_mask = edge_data['is_mst_edge']
-            original_mst_count = np.sum(original_mst_mask)
-            
-            # Verify we have the right number of MST edges
-            expected_mst_edges = n - 1
-            if original_mst_count != expected_mst_edges:
-                if self.verbose:
-                    print(f"         WARNING: Original MST has {original_mst_count} edges, expected {expected_mst_edges}")
-                # If we don't have the right number, recompute
-                mst_mask, mst_rows, mst_cols = self.extract_mst_edges_boruvka(graph, n)
-                # Create a set for comparison later
-                original_mst_edges = set(zip(mst_rows[mst_mask], mst_cols[mst_mask]))
-            else:
-                # Create a set from the existing MST edges
-                original_mst_edges = set()
-                for idx, is_mst in enumerate(original_mst_mask):
-                    if is_mst:
-                        original_mst_edges.add(tuple(edge_arr[idx]))
-        
-        # Extract edges from smoothed graph directly without COO conversion
         smoothed_edge_arr, smoothed_weights = extract_all_edges_from_csr(smoothed_graph, upper_only=True)
-        
-        # Determine MST status for smoothed edges if needed
-        if has_mst_info:
-            smoothed_is_mst_edge = np.array([
-                tuple(edge) in original_mst_edges
-                for edge in smoothed_edge_arr
-            ])
-        else:
-            smoothed_is_mst_edge = None
-        
+
+        # Optional stats
+        smoothed_graph_distance_stats = None
+        if smoothed_weights.size > 0:
+            smoothed_graph_distance_stats = {
+                'mean': float(np.mean(smoothed_weights)),
+                'std':  float(np.std(smoothed_weights)),
+                'min':  float(np.min(smoothed_weights)),
+                'max':  float(np.max(smoothed_weights)),
+                'count': int(smoothed_weights.size),
+            }
+
         smoothed_edge_data = {
-            'edge_arr': smoothed_edge_arr,  # Now storing as array
-            'graph_distances': smoothed_weights
+            'edge_arr': smoothed_edge_arr,
+            'graph_distances': smoothed_weights,
+            'graph_distance_stats': smoothed_graph_distance_stats,
+            # carry through useful flags/stats
+            'euclidean_stats': edge_data.get('euclidean_stats'),
+            'use_euclidean_as_graph_distance': edge_data.get('use_euclidean_as_graph_distance', False),
+            # carry through MST TOPOLOGY ONLY (do not map per-edge MST masks)
+            'mst_csr': edge_data.get('mst_csr'),
+            'mst_computed': bool(edge_data.get('mst_csr') is not None),
         }
-        
-        # Add MST edge information if it was available
-        if smoothed_is_mst_edge is not None:
-            smoothed_edge_data['is_mst_edge'] = smoothed_is_mst_edge
-            
-        # Copy over optimization flag
-        if 'use_euclidean_as_graph_distance' in edge_data:
-            smoothed_edge_data['use_euclidean_as_graph_distance'] = edge_data['use_euclidean_as_graph_distance']
-            
         self.timing.end("smooth_graph_with_2hop.update_edge_data")
-        
-        # Verify the smoothed graph
+
+        # Verify (no MST checks here)
         self.timing.start("smooth_graph_with_2hop.verify")
         if self.verbose:
             print(f"         Smoothed graph has {len(smoothed_edge_arr)} edges")
@@ -1951,25 +1791,18 @@ class DataGraphGenerator:
             if is_smoothed_connected:
                 print(f"         Smoothed graph is connected")
             else:
-                n_components, _ = connected_components(smoothed_graph, directed=False)
-                print(f"         Smoothed graph has {n_components} connected components")
-            
-            # Verify MST edge count
-            if has_mst_info and smoothed_is_mst_edge is not None:
-                mst_edge_count = np.sum(smoothed_edge_data['is_mst_edge'])
-                expected_mst_edges = n - 1
-                if mst_edge_count != expected_mst_edges:
-                    print(f"         WARNING: Smoothed graph has {mst_edge_count} MST edges, expected {expected_mst_edges}")
+                comps, _ = connected_components(smoothed_graph, directed=False)
+                print(f"         Smoothed graph has {comps} connected components")
         self.timing.end("smooth_graph_with_2hop.verify")
-        
+
         self.timing.end("smooth_graph_with_2hop")
         return smoothed_graph, smoothed_edge_data, {
-            'n_new_edges': len(valid_new_edges),
+            'n_new_edges': int(valid_new_edges.shape[0]),
             'new_edges': valid_new_edges,
             'new_distances': new_edge_distances,
             'n_removed': removed_count
         }
-    
+
     def iterative_refine_graph(self,
                        graph,
                        edge_data,
