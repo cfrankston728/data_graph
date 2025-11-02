@@ -144,37 +144,35 @@ def _build_csr_arrays_from_pairs(a, b, w, n):
     return indptr, indices, data
 
 def _csr_from_undirected_edges(a, b, w, n_nodes):
-    # Ensure dtypes up front (avoids slow implicit casts)
-    a = a.astype(np.int32, copy=False)
-    b = b.astype(np.int32, copy=False)
-    w = w.astype(np.float32, copy=False)
+    a = a.astype(np.int32,  copy=False)
+    b = b.astype(np.int32,  copy=False)
+    w = w.astype(np.float64, copy=False)  # use float64 to avoid internal upcasts
     n = int(n_nodes)
 
     indptr, indices, data = _build_csr_arrays_from_pairs(a, b, w, n)
 
-    # (Optional but can help Leiden): sort columns within each row.
-    # Degrees are small (~k≈50–70), so an insertion-sort per row is cheap.
-    _row_sort_inplace(indptr, indices, data)
+    csr = sp.csr_matrix((data, indices, indptr), shape=(n, n), copy=False)
+    csr.sort_indices()  # one fast C-level sort
+    return csr
 
-    return sp.csr_matrix((data, indices, indptr), shape=(n, n), copy=False)
+def _prepare_threads_for_sknetwork(force_omp=None):
+    import os
+    # Figure out how many CPUs Slurm gave you
+    cpus = int(
+        os.environ.get("SLURM_CPUS_PER_TASK")
+        or os.environ.get("SLURM_CPUS_ON_NODE")
+        or (os.cpu_count() or 4)
+    )
+    omp_threads = force_omp or max(2, min(128, cpus))
 
-@nb.njit(cache=True)
-def _row_sort_inplace(indptr, indices, data):
-    for i in range(indptr.size - 1):
-        s = indptr[i]; e = indptr[i+1]
-        # insertion sort is OK for small degrees
-        for j in range(s + 1, e):
-            key_idx = indices[j]
-            key_val = data[j]
-            k = j - 1
-            while k >= s and indices[k] > key_idx:
-                indices[k + 1] = indices[k]
-                data[k + 1]    = data[k]
-                k -= 1
-            indices[k + 1] = key_idx
-            data[k + 1]    = key_val
+    # Avoid BLAS fighting with OpenMP
+    os.environ["OPENBLAS_NUM_THREADS"]   = "1"
+    os.environ["MKL_NUM_THREADS"]        = "1"
+    os.environ["NUMEXPR_NUM_THREADS"]    = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
-
+    # Let Leiden scale
+    os.environ["OMP_NUM_THREADS"] = str(omp_threads)
 
 @nb.njit(cache=True)  # NOTE: no parallel=True
 def mutual_nn_coarsening_directed(sources, targets, weights, n_nodes):
@@ -1487,6 +1485,7 @@ class OptimizedCommunityAnalyzer:
                   ) -> Tuple[pd.DataFrame, np.ndarray]:
         """Run CSR-native Louvain community detection (No warm-start support yet)"""
         try:
+            _prepare_threads_for_sknetwork()
             from sknetwork.clustering import Louvain
         except ImportError:
             raise ImportError("To use CSR-native Louvain, install scikit-network: pip install scikit-network")
@@ -1640,6 +1639,7 @@ class OptimizedCommunityAnalyzer:
         No COO conversions, no array mirroring. Optional warm-start projection supported.
         """
         try:
+            _prepare_threads_for_sknetwork()
             from sknetwork.clustering import Leiden
         except ImportError:
             raise ImportError("Install scikit-network: pip install scikit-network")
@@ -1665,7 +1665,7 @@ class OptimizedCommunityAnalyzer:
             # We have UNIQUE undirected pairs (a<b). Build symmetric CSR without COO.
             a = self.coarsened_sources.astype(np.int32,  copy=False)
             b = self.coarsened_targets.astype(np.int32,  copy=False)
-            w = self.coarsened_weights.astype(np.float32, copy=False)
+            w = self.coarsened_weights.astype(np.float64, copy=False)
             n = int(self.n_nodes_final)
 
             csr = _csr_from_undirected_edges(a, b, w, n)
