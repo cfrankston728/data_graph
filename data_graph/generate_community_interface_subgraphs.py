@@ -113,44 +113,67 @@ perf_monitor = PerformanceMonitor(enabled=True)
 # NUMBA OPTIMIZED FUNCTIONS
 # ============================================================================
 
-def _csr_from_undirected_edges(a, b, w, n_nodes):
-    """
-    Build symmetric CSR from unique undirected pairs (a<b). One pass; no COO.
-    """
-    a = a.astype(np.int32,  copy=False)
-    b = b.astype(np.int32,  copy=False)
-    w = w.astype(np.float32, copy=False)
-    m = a.shape[0]
+import numba as nb
+import numpy as np
+import scipy.sparse as sp
 
-    # degree counts (each edge contributes to two rows)
-    deg = np.zeros(n_nodes, dtype=np.int64)
+@nb.njit(cache=True)
+def _build_csr_arrays_from_pairs(a, b, w, n):
+    # a<b, unique; all dtypes already int32/float32
+    deg = np.zeros(n, np.int32)
+    m = a.size
     for i in range(m):
         deg[a[i]] += 1
         deg[b[i]] += 1
 
-    # indptr
-    indptr = np.empty(n_nodes + 1, dtype=np.int64)
+    indptr = np.empty(n + 1, np.int32)
     indptr[0] = 0
-    for i in range(n_nodes):
-        indptr[i+1] = indptr[i] + deg[i]
+    for i in range(n):
+        indptr[i + 1] = indptr[i] + deg[i]
 
     nnz = int(indptr[-1])
-    indices = np.empty(nnz, dtype=np.int32)
-    data    = np.empty(nnz, dtype=np.float32)
+    indices = np.empty(nnz, np.int32)
+    data    = np.empty(nnz, np.float32)
 
-    # cursors per row
     cursor = indptr[:-1].copy()
-
-    # fill both orientations exactly once
     for i in range(m):
         u = a[i]; v = b[i]; wt = w[i]
         pu = cursor[u]; indices[pu] = v; data[pu] = wt; cursor[u] = pu + 1
         pv = cursor[v]; indices[pv] = u; data[pv] = wt; cursor[v] = pv + 1
 
-    # Optionally: per-row sort indices for deterministic behavior/perf
-    # (sknetwork works either way; sort only if profiling shows benefit)
+    return indptr, indices, data
 
-    return sp.csr_matrix((data, indices, indptr), shape=(n_nodes, n_nodes))
+def _csr_from_undirected_edges(a, b, w, n_nodes):
+    # Ensure dtypes up front (avoids slow implicit casts)
+    a = a.astype(np.int32, copy=False)
+    b = b.astype(np.int32, copy=False)
+    w = w.astype(np.float32, copy=False)
+    n = int(n_nodes)
+
+    indptr, indices, data = _build_csr_arrays_from_pairs(a, b, w, n)
+
+    # (Optional but can help Leiden): sort columns within each row.
+    # Degrees are small (~k≈50–70), so an insertion-sort per row is cheap.
+    _row_sort_inplace(indptr, indices, data)
+
+    return sp.csr_matrix((data, indices, indptr), shape=(n, n), copy=False)
+
+@nb.njit(cache=True)
+def _row_sort_inplace(indptr, indices, data):
+    for i in range(indptr.size - 1):
+        s = indptr[i]; e = indptr[i+1]
+        # insertion sort is OK for small degrees
+        for j in range(s + 1, e):
+            key_idx = indices[j]
+            key_val = data[j]
+            k = j - 1
+            while k >= s and indices[k] > key_idx:
+                indices[k + 1] = indices[k]
+                data[k + 1]    = data[k]
+                k -= 1
+            indices[k + 1] = key_idx
+            data[k + 1]    = key_val
+
 
 
 @nb.njit(cache=True)  # NOTE: no parallel=True
@@ -1635,11 +1658,10 @@ class OptimizedCommunityAnalyzer:
             run_id = f"leiden_res{resolution:.3f}"
         if output_prefix is None:
             output_prefix = f"leiden_{run_id}_"
-
+        
         if self.verbose:
-            print(f"\n--- Running CSR-native Leiden with resolution={resolution} ---")
-
-        with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
+            print(f"\n--- Building csr from undirected edges ---")
+        with perf_monitor.timed_operation(f"\n--- Building csr from undirected edges ---"):
             # We have UNIQUE undirected pairs (a<b). Build symmetric CSR without COO.
             a = self.coarsened_sources.astype(np.int32,  copy=False)
             b = self.coarsened_targets.astype(np.int32,  copy=False)
@@ -1648,6 +1670,10 @@ class OptimizedCommunityAnalyzer:
 
             csr = _csr_from_undirected_edges(a, b, w, n)
 
+        if self.verbose:
+            print(f"\n--- Running CSR-native Leiden with resolution={resolution} ---")
+
+        with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
             # Optional: degree-cap in CSR (keeps symmetry by construction)
             # If you want to cap further, do it BEFORE CSR with an undirected top-k selector,
             # or implement a symmetric row-top-k that ORs selections from both endpoints.
