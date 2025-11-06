@@ -1579,7 +1579,9 @@ class OptimizedCommunityAnalyzer:
                 resolution=float(resolution),
                 random_state=42,
                 modularity='newman',  # keep parity with Leiden config # (older sknetwork versions ignore unknown kwargs; avoid return_probs here)
-                verbose=True
+                verbose=False,
+                return_probs=False,
+                return_aggregate=False
             )
             result = louvain.fit_transform(csr)
 
@@ -1720,7 +1722,8 @@ class OptimizedCommunityAnalyzer:
                 random_state=42,
                 modularity='newman',
                 return_probs=False,
-                verbose=True
+                return_aggregate=False,
+                verbose=False
             )
             result = leiden.fit_transform(csr)
             print(f"Memory after Leiden: {process.memory_info().rss / 1e9:.2f} GB")
