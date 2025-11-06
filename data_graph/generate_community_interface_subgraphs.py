@@ -146,7 +146,7 @@ def _build_csr_arrays_from_pairs(a, b, w, n):
 def _csr_from_undirected_edges(a, b, w, n_nodes):
     a = a.astype(np.int32,  copy=False)
     b = b.astype(np.int32,  copy=False)
-    w = w.astype(np.float64, copy=False)  # use float64 to avoid internal upcasts
+    w = w.astype(np.float32, copy=False)  # use float32 to avoid internal upcasts
     n = int(n_nodes)
 
     indptr, indices, data = _build_csr_arrays_from_pairs(a, b, w, n)
@@ -387,12 +387,12 @@ def _accumulate_stats(
     n_clusters: int
 ):
     # allocate accumulators
-    vol       = np.zeros(n_clusters, dtype=np.float64)
-    cut       = np.zeros(n_clusters, dtype=np.float64)
+    vol       = np.zeros(n_clusters, dtype=np.float32)
+    cut       = np.zeros(n_clusters, dtype=np.float32)
     int_cnt   = np.zeros(n_clusters, dtype=np.int64)
     ext_cnt   = np.zeros(n_clusters, dtype=np.int64)
-    sum_d     = np.zeros(n_clusters, dtype=np.float64)
-    sumsq_d   = np.zeros(n_clusters, dtype=np.float64)
+    sum_d     = np.zeros(n_clusters, dtype=np.float32)
+    sumsq_d   = np.zeros(n_clusters, dtype=np.float32)
 
     for e in nb.prange(sources.shape[0]):
         u = sources[e]
@@ -508,7 +508,7 @@ def sparsify_knn_fast(sources: np.ndarray, targets: np.ndarray,
     # Store edges per node
     total_edges = len(sources)
     edge_targets = np.empty(total_edges, dtype=np.int64)
-    edge_weights = np.empty(total_edges, dtype=np.float64)
+    edge_weights = np.empty(total_edges, dtype=np.float32)
     edge_indices = np.empty(total_edges, dtype=np.int64)
     
     # Reset degrees for filling
@@ -531,7 +531,7 @@ def sparsify_knn_fast(sources: np.ndarray, targets: np.ndarray,
     # Allocate output arrays
     sparse_sources = np.empty(new_edge_count, dtype=np.int64)
     sparse_targets = np.empty(new_edge_count, dtype=np.int64)
-    sparse_weights = np.empty(new_edge_count, dtype=np.float64)
+    sparse_weights = np.empty(new_edge_count, dtype=np.float32)
     sparse_orig_idx = np.empty(new_edge_count, dtype=np.int64)
     
     # Fill output arrays
@@ -590,8 +590,8 @@ def find_knee_point(x: np.ndarray, y: np.ndarray, S: float = 1.0,
     Optimized kneedle algorithm for finding the knee point in a curve.
     Used for determining cluster size thresholds.
     """
-    x = np.array(x, dtype=np.float64)
-    y = np.array(y, dtype=np.float64)
+    x = np.array(x, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
     
     if len(x) <= 2:
         return 0
@@ -777,12 +777,12 @@ class OptimizedGraphLoader:
                     data = np.load(cache, mmap_mode='r')
                     src = data["sources"].astype(np.int64)
                     tgt = data["targets"].astype(np.int64)
-                    dist = data["distances"].astype(np.float64)
+                    dist = data["distances"].astype(np.float32)
                 else:
                     coo = self.adjacency.tocoo()
                     src = coo.row.astype(np.int64)
                     tgt = coo.col.astype(np.int64)
-                    dist = coo.data.astype(np.float64)
+                    dist = coo.data.astype(np.float32)
                     np.savez_compressed(cache,
                                         sources=src.astype(np.int32),
                                         targets=tgt.astype(np.int32),
@@ -1552,8 +1552,8 @@ class OptimizedCommunityAnalyzer:
         with perf_monitor.timed_operation("\n--- Building csr from undirected edges ---"):
             a = self.coarsened_sources.astype(np.int32,  copy=False)
             b = self.coarsened_targets.astype(np.int32,  copy=False)
-            # float64 to avoid internal upcasts in some sknetwork builds; switch to float32 if RAM is tight
-            w = self.coarsened_weights.astype(np.float64, copy=False)
+            # float32 to avoid internal upcasts in some sknetwork builds; switch to float32 if RAM is tight
+            w = self.coarsened_weights.astype(np.float32, copy=False)
             n = int(self.n_nodes_final)
             csr = _csr_from_undirected_edges(a, b, w, n)
 
@@ -1687,7 +1687,7 @@ class OptimizedCommunityAnalyzer:
             # We have UNIQUE undirected pairs (a<b). Build symmetric CSR without COO.
             a = self.coarsened_sources.astype(np.int32,  copy=False)
             b = self.coarsened_targets.astype(np.int32,  copy=False)
-            w = self.coarsened_weights.astype(np.float64, copy=False)
+            w = self.coarsened_weights.astype(np.float32, copy=False)
             n = int(self.n_nodes_final)
 
             csr = _csr_from_undirected_edges(a, b, w, n)
@@ -2277,8 +2277,8 @@ class OptimizedCommunityAnalyzer:
     
             # 3) post‐process into final metrics
             # mean & std for internal distances
-            mean_int = np.zeros(n_clusters, dtype=np.float64)
-            std_int  = np.zeros(n_clusters, dtype=np.float64)
+            mean_int = np.zeros(n_clusters, dtype=np.float32)
+            std_int  = np.zeros(n_clusters, dtype=np.float32)
             for i in range(n_clusters):
                 cnt = int_cnt[i]
                 if cnt > 0:
@@ -2296,12 +2296,12 @@ class OptimizedCommunityAnalyzer:
             node_counts = np.bincount(cluster_idx, minlength=n_clusters)
             # possible edges per cluster
             max_edges = node_counts * (node_counts - 1) / 2
-            density  = np.zeros(n_clusters, dtype=np.float64)
+            density  = np.zeros(n_clusters, dtype=np.float32)
             nonzero  = max_edges > 0
             density[nonzero] = int_cnt[nonzero] / max_edges[nonzero]
     
             # edge‐to‐node ratio
-            e2n = np.zeros(n_clusters, dtype=np.float64)
+            e2n = np.zeros(n_clusters, dtype=np.float32)
             nonz = node_counts > 0
             e2n[nonz] = int_cnt[nonz] / node_counts[nonz]
     
@@ -2844,7 +2844,7 @@ def process_resolution_shared(resolution, shared_data, output_dir, run_name,
     edge_data = np.load(shared_data['edges'])
     sources = np.asarray(edge_data['sources'], dtype=np.int64)
     targets = np.asarray(edge_data['targets'], dtype=np.int64)
-    distances = np.asarray(edge_data['distances'], dtype=np.float64)
+    distances = np.asarray(edge_data['distances'], dtype=np.float32)
     
     # Load CSR structure
     csr_data = np.load(shared_data['csr'])
