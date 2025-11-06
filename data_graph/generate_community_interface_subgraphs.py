@@ -1523,19 +1523,20 @@ class OptimizedCommunityAnalyzer:
                     output_prefix: Optional[str] = None
                    ) -> Tuple[pd.DataFrame, np.ndarray]:
         """Run CSR-native Louvain on a symmetric CSR built DIRECTLY from unique undirected pairs (a<b).
-        No COO conversions, no array mirroring. Mirrors run_leiden_csr() structure for parity.
+        Mirrors run_leiden_csr structure for parity. Louvain in sknetwork does *not* accept initial
+        labels at fit time; any provided initial_membership is only projected/validated.
         """
-        _prepare_threads_for_sknetwork()
         try:
+            _prepare_threads_for_sknetwork()
             from sknetwork.clustering import Louvain
         except ImportError:
-            raise ImportError("To use CSR-native Louvain, install scikit-network: pip install scikit-network")
+            raise ImportError("Install scikit-network: pip install scikit-network")
 
-        # Ensure CSR helpers (if you cache elsewhere)
+        # Ensure CSR structures (offsets/indices) cached if you use them elsewhere
         if not self._csr_built:
             self._ensure_csr_built()
 
-        # Ensure sparsify/coarsen executed
+        # Ensure sparsify/coarsen has been executed
         if not self._graph_prepared:
             self._ensure_prepared()
             self._initialized = True
@@ -1546,54 +1547,57 @@ class OptimizedCommunityAnalyzer:
         if output_prefix is None:
             output_prefix = f"louvain_{run_id}_"
 
-        # Build symmetric CSR (unique a<b → both orientations)
+        # --- Build symmetric CSR from unique undirected edges ---
         if self.verbose:
             print(f"\n--- Building csr from undirected edges ---")
         with perf_monitor.timed_operation("\n--- Building csr from undirected edges ---"):
+            # UNIQUE undirected pairs (a<b) → symmetric CSR without COO mirroring in Python
             a = self.coarsened_sources.astype(np.int32,  copy=False)
             b = self.coarsened_targets.astype(np.int32,  copy=False)
-            # float32 to avoid internal upcasts in some sknetwork builds; switch to float32 if RAM is tight
             w = self.coarsened_weights.astype(np.float32, copy=False)
             n = int(self.n_nodes_final)
+
             csr = _csr_from_undirected_edges(a, b, w, n)
+
+            # Hygiene for sknetwork internals: sorted indices + float32 data
+            if hasattr(csr, "has_sorted_indices"):
+                if not csr.has_sorted_indices:
+                    csr.sort_indices()
+            else:
+                csr.sort_indices()
+            if csr.data.dtype != np.float32:
+                csr.data = csr.data.astype(np.float32, copy=False)
 
         if self.verbose:
             print(f"\n--- Running CSR-native Louvain with resolution={resolution} ---")
 
         with perf_monitor.timed_operation(f"Louvain clustering (res={resolution})"):
-
-            # Warm start: Louvain in sknetwork does NOT accept initial labels; validate & ignore.
+            # Warm-start-style projection (fine -> coarse) for parity with Leiden API.
+            # NOTE: sknetwork Louvain does NOT take initial labels; this is validation only.
             if initial_membership is not None:
                 if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    _ = self._project_labels_to_coarse_mode(initial_membership)  # computed but not used
+                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
                 elif initial_membership.shape[0] != n:
                     raise ValueError(
                         f"initial_membership has length {initial_membership.shape[0]}, expected "
                         f"{self.loader.n_nodes} (fine) or {n} (coarse)."
                     )
                 if self.verbose:
-                    print("  (Note) sknetwork Louvain does not support warm-start labels; ignoring provided initial_membership.")
+                    print("  (Note) sknetwork Louvain ignores warm-start labels; using only for shape checks.")
 
-            # Run Louvain (weights from csr.data)
+            # Construct Louvain with lean outputs (match Leiden config philosophy)
             louvain = Louvain(
                 resolution=float(resolution),
+                modularity='newman',     # undirected, standard modularity
+                return_probs=False,      # avoid dense membership/prob matrices
+                return_aggregate=False,  # don't keep hierarchy
+                shuffle_nodes=False,     # more deterministic / parity with Leiden
                 random_state=42,
-                modularity='newman',  # keep parity with Leiden config # (older sknetwork versions ignore unknown kwargs; avoid return_probs here)
-                verbose=False,
-                return_probs=False,
-                return_aggregate=False
+                verbose=False
             )
-            result = louvain.fit_transform(csr)
 
-            # Extract labels
-            if hasattr(louvain, 'labels_'):
-                labels = np.asarray(louvain.labels_, dtype=np.int32)
-            elif isinstance(result, np.ndarray):
-                labels = result.astype(np.int32, copy=False).ravel()
-            elif sp.issparse(result):
-                labels = np.asarray(result.toarray(), dtype=np.int32).ravel()
-            else:
-                raise ValueError(f"Cannot interpret Louvain result of type {type(result)}")
+            # >>> Use fit_predict (labels only), matching run_leiden_csr
+            labels = louvain.fit_predict(csr).astype(np.int32, copy=False)
 
             # Sanity check
             if labels.ndim != 1 or labels.shape[0] != n:
@@ -1602,15 +1606,16 @@ class OptimizedCommunityAnalyzer:
             # Project labels back to fine level if coarsened
             if self.coarsened:
                 full_labels = np.empty(self.loader.n_nodes, dtype=np.int32)
+                # meta_id maps fine node -> coarse node id
                 for i in range(self.loader.n_nodes):
                     full_labels[i] = labels[self.meta_id[i]]
                 labels = full_labels
 
             if self.verbose:
-                n_clusters = len(np.unique(labels))
+                n_clusters = int(np.unique(labels).size)
                 print(f"Found {n_clusters} communities")
 
-        # ---- Post-processing (identical to Leiden path) ----
+        # ---- Post-processing (identical structure to Leiden path) ----
         with perf_monitor.timed_operation("Process cluster labels"):
             df = self.loader.node_df.copy()
             cluster_col = f'{output_prefix}cluster'
@@ -1658,7 +1663,8 @@ class OptimizedCommunityAnalyzer:
                    reassign_pruned: bool = False,
                    output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
         """Run CSR-native Leiden on a symmetric CSR built DIRECTLY from unique undirected pairs (a<b).
-        No COO conversions, no array mirroring. Optional warm-start projection supported.
+        No COO conversions, no array mirroring. Optional warm-start projection supported (projection only;
+        sknetwork.Leiden doesn't accept an initial partition at fit time).
         """
         try:
             _prepare_threads_for_sknetwork()
@@ -1680,7 +1686,7 @@ class OptimizedCommunityAnalyzer:
             run_id = f"leiden_res{resolution:.3f}"
         if output_prefix is None:
             output_prefix = f"leiden_{run_id}_"
-        
+
         if self.verbose:
             print(f"\n--- Building csr from undirected edges ---")
         with perf_monitor.timed_operation(f"\n--- Building csr from undirected edges ---"):
@@ -1692,17 +1698,21 @@ class OptimizedCommunityAnalyzer:
 
             csr = _csr_from_undirected_edges(a, b, w, n)
 
+            # Hygiene for sknetwork internals: sorted indices + float32 data avoids hidden copies
+            # (sknetwork casts to float32 internally anyway).
+            if hasattr(csr, "has_sorted_indices"):
+                if not csr.has_sorted_indices:
+                    csr.sort_indices()
+            else:
+                csr.sort_indices()
+            if csr.data.dtype != np.float32:
+                csr.data = csr.data.astype(np.float32, copy=False)
+
         if self.verbose:
             print(f"\n--- Running CSR-native Leiden with resolution={resolution} ---")
 
         with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
-            # Optional: degree-cap in CSR (keeps symmetry by construction)
-            # If you want to cap further, do it BEFORE CSR with an undirected top-k selector,
-            # or implement a symmetric row-top-k that ORs selections from both endpoints.
-            # For now, we skip additional degree caps to avoid symmetry breakage.
-            # If you still want it and have a symmetric top-k utility, call it here.
-
-            # Warm start: project fine → coarse if needed
+            # Warm start projection (fine -> coarse) if provided; note: not passed to Leiden
             if initial_membership is not None:
                 if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
                     initial_membership = self._project_labels_to_coarse_mode(initial_membership)
@@ -1711,32 +1721,29 @@ class OptimizedCommunityAnalyzer:
                         f"initial_membership has length {initial_membership.shape[0]}, expected "
                         f"{self.loader.n_nodes} (fine) or {n} (coarse)."
                     )
-            
-            process = psutil.Process()
 
+            process = psutil.Process()
             print(f"Memory before Leiden: {process.memory_info().rss / 1e9:.2f} GB")
             print(f"Available memory: {psutil.virtual_memory().available / 1e9:.2f} GB")
-            # Run Leiden (weights taken from csr.data)
+
+            # Construct Leiden (lean outputs, stable iteration; keep verbose to see aggregation/gain logs)
             leiden = Leiden(
                 resolution=float(resolution),
-                random_state=42,
-                modularity='newman',
-                return_probs=False,
-                return_aggregate=False,
-                verbose=False
+                modularity='newman',         # fine for undirected
+                return_probs=False,          # avoid building membership/prob matrix
+                return_aggregate=False,      # don't store coarse graph
+                tol_optimization=1e-3,
+                tol_aggregation=1e-3,        # raise to 1e-2 if any γ shows many tiny-gain levels
+                n_aggregations=50,           # safety cap for pathological chains
+                shuffle_nodes=False,         # less run-to-run variance
+                random_state=42,             # deterministic
+                verbose=False                 # prints "Aggregation: ..., Increase: ..."
             )
-            result = leiden.fit_transform(csr)
-            print(f"Memory after Leiden: {process.memory_info().rss / 1e9:.2f} GB")
 
-            # Extract labels
-            if hasattr(leiden, 'labels_'):
-                labels = np.asarray(leiden.labels_, dtype=np.int32)
-            elif isinstance(result, np.ndarray):
-                labels = result.astype(np.int32).ravel()
-            elif sp.issparse(result):
-                labels = np.asarray(result.toarray(), dtype=np.int32).ravel()
-            else:
-                raise ValueError(f"Cannot interpret Leiden result of type {type(result)}")
+            # >>> Use fit_predict (labels only) instead of fit_transform (which builds membership)
+            labels = leiden.fit_predict(csr).astype(np.int32, copy=False)
+
+            print(f"Memory after Leiden: {process.memory_info().rss / 1e9:.2f} GB")
 
             if labels.ndim != 1 or labels.shape[0] != n:
                 raise ValueError(f"Leiden labels have wrong shape {labels.shape}")
@@ -1750,7 +1757,7 @@ class OptimizedCommunityAnalyzer:
                 labels = full_labels
 
             if self.verbose:
-                n_clusters = len(np.unique(labels))
+                n_clusters = int(np.unique(labels).size)
                 print(f"Found {n_clusters} communities")
 
         # ---- Post-processing (unchanged) ----
@@ -1789,6 +1796,7 @@ class OptimizedCommunityAnalyzer:
             self.interface_edges[run_id] = interface_edges_df
 
         return cluster_stats, labels
+
 
     def _process_cluster_stats(self, df, labels, cluster_col, rank_col, rank_stat_col, 
                           normalize_rank_stat, prune_small_clusters, 
