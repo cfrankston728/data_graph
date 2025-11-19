@@ -249,6 +249,77 @@ def aggregate_undirected_edges_with_dist(s, t, w, d):
 
     return out_a[:out], out_b[:out], out_w[:out], out_d[:out]
 
+# ---- paste this helper once (near your Numba helpers) ----
+def aggregate_undirected_edges_with_dist_chunked(s, t, w, d, chunk=8_000_000):
+    """Memory-safe aggregation to UNIQUE undirected pairs a<b.
+    Weight = SUM of weights; distance = MIN of distances.
+    Splits into chunks, sorts/dedups each chunk, concatenates,
+    then final dedup via your numba dedup.
+    """
+    n = s.shape[0]
+    if n == 0:
+        return (s.astype(np.int64), t.astype(np.int64),
+                w.astype(w.dtype), d.astype(d.dtype))
+
+    outs_a, outs_b, outs_w, outs_d = [], [], [], []
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+
+        a = s[start:end].astype(np.int64, copy=False)
+        b = t[start:end].astype(np.int64, copy=False)
+        ww = w[start:end].astype(w.dtype, copy=True)
+        dd = d[start:end].astype(d.dtype, copy=True)
+
+        # canonicalize to a<b
+        mask = a > b
+        if mask.any():
+            a2 = a.copy(); b2 = b.copy()
+            a2[mask] = b[mask]; b2[mask] = a[mask]
+            a, b = a2, b2
+
+        # sort by packed key
+        keys  = (a << 32) | b
+        order = np.argsort(keys)
+        a = a[order]; b = b[order]; ww = ww[order]; dd = dd[order]
+
+        # in-chunk combine (sum weights, min dist)
+        ua = [a[0]]; ub = [b[0]]; uw = [ww[0]]; ud = [dd[0]]
+        for i in range(1, a.size):
+            if a[i] == ua[-1] and b[i] == ub[-1]:
+                uw[-1] += ww[i]
+                if dd[i] < ud[-1]:
+                    ud[-1] = dd[i]
+            else:
+                ua.append(a[i]); ub.append(b[i]); uw.append(ww[i]); ud.append(dd[i])
+
+        outs_a.append(np.asarray(ua, dtype=np.int64))
+        outs_b.append(np.asarray(ub, dtype=np.int64))
+        outs_w.append(np.asarray(uw, dtype=ww.dtype))
+        outs_d.append(np.asarray(ud, dtype=dd.dtype))
+
+    # concatenate chunk results and final dedup (maxw/mind == sum/mind works when each (a,b) appears once per chunk)
+    A = np.concatenate(outs_a); B = np.concatenate(outs_b)
+    W = np.concatenate(outs_w); D = np.concatenate(outs_d)
+    # final dedup: we want SUM weights, MIN distance. Use your existing combiner semantics.
+    # dedup_undirected_maxw_mind does MAX for weights; we want SUM → do a tiny local pass:
+    keys = (A << 32) | B
+    order = np.argsort(keys)
+    A = A[order]; B = B[order]; W = W[order]; D = D[order]
+
+    out_a = [A[0]]; out_b = [B[0]]; out_w = [W[0]]; out_d = [D[0]]
+    for i in range(1, A.size):
+        if A[i] == out_a[-1] and B[i] == out_b[-1]:
+            out_w[-1] += W[i]
+            if D[i] < out_d[-1]:
+                out_d[-1] = D[i]
+        else:
+            out_a.append(A[i]); out_b.append(B[i]); out_w.append(W[i]); out_d.append(D[i])
+
+    return (np.asarray(out_a, dtype=np.int64),
+            np.asarray(out_b, dtype=np.int64),
+            np.asarray(out_w, dtype=W.dtype),
+            np.asarray(out_d, dtype=D.dtype))
+
 
 @nb.njit(cache=True)
 def dedup_undirected_maxw_mind(sel_u, sel_v, sel_w, sel_d):
@@ -934,7 +1005,6 @@ class OptimizedCommunityAnalyzer:
             self._csr_indices = self.loader.csr_indices
             self._csr_built = True
 
-    
     def _ensure_prepared(self):
         """Ensure graph is prepared—coarsening before sparsification—when needed."""
         if not self._graph_prepared:
@@ -967,8 +1037,8 @@ class OptimizedCommunityAnalyzer:
     
     def _apply_pre_coarsening_sparsification(self):
         if self.verbose:
-            print(f"Sparsifying pre-coarsened graph (k={self.sparsify_pre_k})…")
-        with perf_monitor.timed_operation("Pre-coarsened graph sparsification"):
+            print(f"Sparsifying un-coarsened graph (k={self.sparsify_pre_k})…")
+        with perf_monitor.timed_operation("Un-coarsened graph sparsification"):
             sims = self._compute_similarities(self.full_distances, scale="adaptive")
             s, t, w, orig_idx = sparsify_knn_fast(
                 self.sources, self.targets, sims, self.loader.n_nodes, int(self.sparsify_pre_k)
@@ -978,12 +1048,12 @@ class OptimizedCommunityAnalyzer:
             self.targets   = t.astype(np.int64, copy=False)
             self.distances = self.full_distances[orig_idx].astype(np.float32, copy=False)
             if self.verbose:
-                print(f"  Sparsified pre-coarsened graph to {len(self.sources):,} directed edges")
+                print(f"  Sparsified un-coarsened graph to {len(self.sources):,} directed edges")
                 
     def _apply_post_coarsened_sparsification(self):
         """Undirected top-k on coarsened unique pairs (a<b) — stays (a<b)."""
         if self.verbose:
-            print(f"Sparsifying post-coarsened graph (k={self.sparsify_post_k})…")
+            print(f"Sparsifying coarsened graph (k={self.sparsify_post_k})…")
 
         with perf_monitor.timed_operation("Graph sparsification"):
             a  = self.coarsened_sources.astype(np.int64,  copy=False)
@@ -1030,13 +1100,15 @@ class OptimizedCommunityAnalyzer:
         return self._similarity_cache[cache_key]
     
     def _apply_coarsening(self):
-        """Directed reciprocal 1-NN → aggregate to unique UNDIRECTED meta-edges (a<b).
-        Track distances (min) and weights (sum). Then run undirected post-k.
+        """Reciprocal 1-NN coarsening over undirected graph.
+        - Each level merges nodes via mutual_nn_coarsening_directed
+        - Aggregates to unique undirected (a<b)
+        - Applies per-level top-k sparsification (k scales relative to previous level)
+        - Clears cache per level
         """
         if self.verbose:
             print(f"Applying {self.coarsen_levels} levels of coarsening…")
 
-        # Start from directed graph
         current_sources   = self.sources.astype(np.int64,  copy=False)
         current_targets   = self.targets.astype(np.int64,  copy=False)
         current_distances = self.distances.astype(np.float32, copy=False)
@@ -1046,93 +1118,103 @@ class OptimizedCommunityAnalyzer:
         cumulative_mapping = np.arange(current_n_nodes, dtype=np.int64)
         self.coarsening_hierarchy = []
 
+        # Determine memory-based chunking thresholds
+        avail_gb = psutil.virtual_memory().available / 1e9
+        MAX_AGG_EDGES = 30_000_000 if avail_gb >= 64 else 20_000_000
+        CHUNK = 8_000_000 if avail_gb >= 64 else 4_000_000
+
+        # Start with the configured pre-coarsening k
+        k_prev = int(self.sparsify_pre_k)
+
         for level in range(self.coarsen_levels):
             if self.verbose:
                 print(f"  Level {level+1}: {current_n_nodes:,} nodes")
 
-            # mutual 1-NN on directed edges (safe sequential version)
+            # === Reciprocal 1-NN on undirected graph ===
             meta_id, n_meta = mutual_nn_coarsening_directed(
                 current_sources, current_targets, current_weights, current_n_nodes
             )
             ratio = n_meta / current_n_nodes
             self.coarsening_hierarchy.append({
-                'level': level,
-                'original_nodes': current_n_nodes,
-                'coarsened_nodes': int(n_meta),
-                'reduction_ratio': float(ratio)
+                "level": level,
+                "original_nodes": current_n_nodes,
+                "coarsened_nodes": int(n_meta),
+                "reduction_ratio": float(ratio),
             })
             if self.verbose:
                 print(f"    → {n_meta:,} meta-nodes (ratio: {ratio:.3f})")
 
-            # Early stop if weak reduction or very small
-            if n_meta < 1000 or ratio > 0.95:
-                # still produce unique (a<b) at this level
-                ms = meta_id[current_sources]
-                mt = meta_id[current_targets]
-                keep = (ms != mt)
-                if np.any(keep):
-                    a, b, w, d = aggregate_undirected_edges_with_dist(
-                        ms[keep], mt[keep],
-                        current_weights[keep], current_distances[keep]
-                    )
-                    current_sources   = a.astype(np.int64,  copy=False)
-                    current_targets   = b.astype(np.int64,  copy=False)
-                    current_weights   = w.astype(np.float32, copy=False)
-                    current_distances = d.astype(np.float32, copy=False)
-                else:
-                    # degenerate case: no edges
-                    current_sources = current_sources[:0]
-                    current_targets = current_targets[:0]
-                    current_weights = current_weights[:0]
-                    current_distances = current_distances[:0]
-
-                cumulative_mapping = meta_id[cumulative_mapping]
-                current_n_nodes = int(n_meta)
-                break
-
-
-            # Map to meta-nodes, still directed; drop self loops
+            # Map to meta-nodes and drop self-loops
             ms = meta_id[current_sources]
             mt = meta_id[current_targets]
             keep = (ms != mt)
-            ms = ms[keep]; mt = mt[keep]
-            mw = current_weights[keep]; md = current_distances[keep]
+            if not np.any(keep):
+                if self.verbose:
+                    print("    (No edges survive this level)")
+                current_sources = current_targets = np.empty(0, np.int64)
+                current_weights = current_distances = np.empty(0, np.float32)
+                cumulative_mapping = meta_id[cumulative_mapping]
+                current_n_nodes = int(n_meta)
+                self._similarity_cache.clear()
+                gc.collect()
+                break
 
-            # Aggregate to UNIQUE undirected pairs (a<b): sum weights, min dist
-            a, b, w, d = aggregate_undirected_edges_with_dist(ms, mt, mw, md)
+            ms, mt = ms[keep], mt[keep]
+            mw, md = current_weights[keep], current_distances[keep]
 
-            # Prepare for next level
+            # Choose aggregation path
+            need_early_stop = (n_meta < 1000) or (ratio > 0.95)
+            if True and (need_early_stop or ms.size > MAX_AGG_EDGES): # TURN ON CHUNKING IF NEEDED
+                a, b, w, d = aggregate_undirected_edges_with_dist_chunked(ms, mt, mw, md, chunk=CHUNK)
+            else:
+                a, b, w, d = aggregate_undirected_edges_with_dist(ms, mt, mw, md)
+
+            # === Per-level undirected top-k (adaptive scaling) ===
+            if self.sparsify:
+                # scale relative to previous level’s k
+                k_level = max(1, int(round(k_prev * ratio)))
+                a, b, w, d = sparsify_knn_undirected(a, b, w, d, int(n_meta), int(k_level))
+                if self.verbose:
+                    print(f"    → Sparsified to {len(a):,} undirected edges (k={k_level})")
+                k_prev = k_level  # update for next level
+
+            # Prepare next level inputs (still undirected)
             cumulative_mapping = meta_id[cumulative_mapping]
-            current_n_nodes    = int(n_meta)
-            current_sources    = a.astype(np.int64,  copy=False)
-            current_targets    = b.astype(np.int64,  copy=False)
-            current_weights    = w.astype(np.float32, copy=False)
-            current_distances  = d.astype(np.float32, copy=False)
+            current_n_nodes = int(n_meta)
+            current_sources, current_targets = a, b
+            current_weights, current_distances = w, d
 
             if self.verbose:
-                print(f"    → Aggregated to {len(current_sources):,} unique undirected edges")
+                avg_deg = (2 * len(a)) / max(1, n_meta)
+                print(f"    → Aggregated to {len(a):,} edges | avg deg ≈ {avg_deg:.2f}")
 
-        # Store final state (unique undirected a<b)
-        self.coarsened         = True
-        self.meta_id           = cumulative_mapping
-        self.n_nodes_final     = int(current_n_nodes)
-        self.coarsening_ratio  = float(self.n_nodes_final / self.loader.n_nodes)
-        self.coarsened_sources = current_sources.astype(np.int32,  copy=False)
-        self.coarsened_targets = current_targets.astype(np.int32,  copy=False)
+            self._similarity_cache.clear()
+            gc.collect()
+
+            if need_early_stop:
+                break
+
+        # === Store final state ===
+        self.coarsened = True
+        self.meta_id = cumulative_mapping
+        self.n_nodes_final = int(current_n_nodes)
+        self.coarsening_ratio = float(self.n_nodes_final / self.loader.n_nodes)
+        self.coarsened_sources = current_sources.astype(np.int32, copy=False)
+        self.coarsened_targets = current_targets.astype(np.int32, copy=False)
         self.coarsened_weights = current_weights.astype(np.float32, copy=False)
-        self.distances         = current_distances.astype(np.float32, copy=False)
+        self.distances = current_distances.astype(np.float32, copy=False)
 
-        # Scale post-k target if desired
+        # === Scale post-k for final pass relative to last level ===
         prev = getattr(self, "sparsify_post_k", None)
         if prev is None:
-            self.sparsify_post_k = max(1, int(self.sparsify_pre_k * self.coarsening_ratio))
+            self.sparsify_post_k = max(1, int(k_prev * self.coarsening_ratio))
         else:
             self.sparsify_post_k = max(1, int(prev * self.coarsening_ratio))
 
-        # >>> IMPORTANT: run undirected post-k here <<<
+        # === Final post-coarsened sparsify ===
         if self.sparsify and self.sparsify_post_k > 0:
             self._apply_post_coarsened_sparsification()
-    
+
     def _project_labels_to_coarse_mode(self, fine_labels: np.ndarray) -> np.ndarray:
         """
         Project fine-level labels (size = |V|) to the current coarse graph (size = |V'|)
@@ -1739,6 +1821,8 @@ class OptimizedCommunityAnalyzer:
                 random_state=42,             # deterministic
                 verbose=False                 # prints "Aggregation: ..., Increase: ..."
             )
+
+            print(f"Constructed Leiden object; starting fit_predict...")
 
             # >>> Use fit_predict (labels only) instead of fit_transform (which builds membership)
             labels = leiden.fit_predict(csr).astype(np.int32, copy=False)
@@ -3026,10 +3110,7 @@ def main(location, output_dir, run_name, resolutions, similarity_scale,
     
     # Process resolutions
     scale = similarity_scale if similarity_scale else 'adaptive'
-    
-    # Process resolutions
-    scale = similarity_scale if similarity_scale else 'adaptive'
-    
+
     if not parallel:
         # Sequential processing with warm-start
         print("\nProcessing resolutions sequentially...")
