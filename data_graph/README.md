@@ -23,7 +23,7 @@ A Python library for creating and refining sparse graphs from data using custom 
 * [Performance Tips](#performance-tips)
 * [Benchmarking & Timing](#benchmarking--timing)
 
-  * [End-to-End Pipeline (2M scMicroC models)](#endtoend-pipeline-2m-scmicroc-models)
+  * [End-to-End Pipeline](#endtoend-pipeline)
   * [Example: Large-Scale Run Log](#example-largescale-run-log)
   * [Timing Summary (parsed)](#timing-summary-parsed)
   * [Interpreting the Numbers](#interpreting-the-numbers)
