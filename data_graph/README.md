@@ -304,7 +304,7 @@ graph_obj, results = generator.build_and_refine_graph(
 
 ### End-to-End Pipeline
 
-Rough wall-clock times observed on a ~2M-item scMicroC dataset (10kbp scHiC + scRNA), provided for planning/ballparking:
+Rough wall-clock times observed on a ~2M-item graph, provided for planning/ballparking:
 
 * **Graph**
 
