@@ -4,7 +4,7 @@ Data Graph Package - Tools for creating, visualizing, and analyzing graphs with 
 
 # Import main classes for easy access
 from .data_graph import DataGraph
-from .data_graph_generator import DataGraphGenerator
+from .construction_coarsening_generator import ConstructionCoarseningDataGraphGenerator as DataGraphGenerator
 from .data_graph_visualizer import DataGraphVisualizer
 from .data_graph_analyzer import DataGraphAnalyzer
 

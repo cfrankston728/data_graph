@@ -129,6 +129,7 @@ class DataGraph:
         self.node_features = arr
         
     def compute_graph_distance(self, i, j):
+        """Compute the configured premetric distance between two node indices."""
         return self.premetric_weight_function(self.node_features, i, j)
         
     def compute_components(self):
@@ -188,6 +189,7 @@ class DataGraph:
         return neighbors, weights
     
     def get_edge_weight(self, i, j):
+        """Return an edge weight, ``self_weight`` for self-edges, or missing weight."""
         if i==j:
             return self.self_weight
         start, end = self.graph.indptr[i], self.graph.indptr[i+1]
@@ -302,6 +304,7 @@ class DataGraph:
                 f"{self.graph.nnz//2} edges, {self.n_components} components")
     
     def __repr__(self):
+        """Return the same compact summary used by ``str(graph)``."""
         return self.__str__()
 
     def save(self, output_dir="saved_data_graph", embedding=None, embedding_params=None,

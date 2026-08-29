@@ -74,6 +74,13 @@ def _union_find_parent(parent, i):
     return i
 
 @njit
+def _union_find_root_readonly(parent, i):
+    """Find root without path compression; safe for concurrent read-only scans."""
+    while parent[i] != i:
+        i = parent[i]
+    return i
+
+@njit
 def _union_by_rank(parent, rank, x, y):
     """Union by rank for union-find data structure."""
     xroot = _union_find_parent(parent, x)
@@ -208,7 +215,7 @@ def boruvka_mst_hybrid(n, rows, cols, weights, parallel_threshold=50000):
 
 
 # Optional: Active component tracking for additional optimization
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def boruvka_mst_parallel_active(n, rows, cols, weights):
     """
     Parallel Borůvka with both thread-local reduction and active component tracking.
@@ -242,8 +249,8 @@ def boruvka_mst_parallel_active(n, rows, cols, weights):
             v = cols[e]
             
             # Find roots
-            ru = _union_find_parent(parent, u)
-            rv = _union_find_parent(parent, v)
+            ru = _union_find_root_readonly(parent, u)
+            rv = _union_find_root_readonly(parent, v)
             
             if ru == rv:
                 continue
@@ -256,11 +263,11 @@ def boruvka_mst_parallel_active(n, rows, cols, weights):
             
             # Update thread-local cheapest
             ce = cheapest_per_thread[tid, ru]
-            if ce < 0 or w < weights[ce]:
+            if ce < 0 or w < weights[ce] or (w == weights[ce] and e < ce):
                 cheapest_per_thread[tid, ru] = e
             
             ce = cheapest_per_thread[tid, rv]
-            if ce < 0 or w < weights[ce]:
+            if ce < 0 or w < weights[ce] or (w == weights[ce] and e < ce):
                 cheapest_per_thread[tid, rv] = e
         
         # Phase 2: Serial reduction
@@ -272,7 +279,7 @@ def boruvka_mst_parallel_active(n, rows, cols, weights):
                 e = cheapest_per_thread[t, comp]
                 if e >= 0:
                     ce = cheapest[comp]
-                    if ce < 0 or weights[e] < weights[ce]:
+                    if ce < 0 or weights[e] < weights[ce] or (weights[e] == weights[ce] and e < ce):
                         cheapest[comp] = e
         
         # Phase 3: Merge components
@@ -437,6 +444,7 @@ def extract_upper_triangle_edges_from_csr(graph):
 
 @njit
 def count_edges_per_row(indptr, indices, n, upper_only):
+    """Count CSR row edges, optionally keeping only upper-triangle entries."""
     counts = np.zeros(n, dtype=np.int32)
     for i in range(n):
         for j_idx in range(indptr[i], indptr[i+1]):
@@ -447,6 +455,7 @@ def count_edges_per_row(indptr, indices, n, upper_only):
 
 @njit
 def prefix_sum(arr):
+    """Return exclusive prefix positions and the total item count."""
     total = 0
     out = np.empty_like(arr)
     for i in range(arr.shape[0]):
@@ -454,8 +463,9 @@ def prefix_sum(arr):
         total += arr[i]
     return out, total
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def extract_all_edges_from_csr_numba(indptr, indices, data, n, upper_only):
+    """Extract CSR edges into dense ``(source, target)`` and weight arrays."""
     # Phase 1: how many edges from each row?
     per_row = count_edges_per_row(indptr, indices, n, upper_only)
     prefix, edge_count = prefix_sum(per_row)
@@ -533,6 +543,16 @@ def find_2hop_neighbors_sparse(graph):
 
     
 class DataGraphGenerator:
+    """Build and refine sparse DataGraph objects from tabular node features.
+
+    Neighbor discovery and edge weighting are deliberately separate. Embeddings
+    and optional KNN dimensionality reduction select candidate neighbors, while
+    the configured premetric computes graph edge distances unless
+    ``knn_weights_from`` requests weights from the KNN representation. The
+    current production path returns a refined full-resolution DataGraph;
+    pre-community coarsening is performed later by the Leiden/Louvain helper and
+    is not persisted by this generator yet.
+    """
     def __init__(self,
                  node_df,
                  feature_cols,
@@ -546,7 +566,8 @@ class DataGraphGenerator:
                  use_euclidean_as_graph_distance=False,
                  use_gpu_mst=False,
                  knn_reduction=None,
-                 knn_weights_from="reduced"):
+                 knn_weights_from="reduced",
+                 embedding_vectorizer=None):
         """
         Graph generator for a custom distance graph over data
         
@@ -581,6 +602,7 @@ class DataGraphGenerator:
         self.feature_cols = feature_cols
         self.premetric_weight_function = premetric_weight_function
         self.embedding_function = embedding_function
+        self.embedding_vectorizer = embedding_vectorizer
         
         self._extract_node_features()
         
@@ -598,6 +620,7 @@ class DataGraphGenerator:
         self.knn_weights_from = knn_weights_from
 
     def _extract_node_features(self):
+        """Load configured numeric columns into a C-contiguous float32 array."""
         # pick your columns
         if self.feature_cols is None:
             df = self.node_df.select_dtypes(include='number')
@@ -718,8 +741,12 @@ class DataGraphGenerator:
 
     def build_graph_from_edges_memory_efficient(self, edge_arr, distances, is_valid_edge, n, batch_size=None):
         """
-        Build CSR matrix with minimal memory footprint, de‑duplicated and sorted.
-        Now accepts edge_arr as (n_edges, 2) array instead of list of tuples.
+        Build CSR matrix with minimal memory footprint, de-duplicated and sorted.
+        Accepts edge_arr as an (n_edges, 2) array.
+
+        Materializes the doubled undirected edge arrays directly into
+        exact-size preallocated buffers instead of accumulating batch blocks
+        and concatenating them afterward.
         """
         valid_indices = np.where(is_valid_edge)[0]
         n_valid = len(valid_indices)
@@ -729,38 +756,33 @@ class DataGraphGenerator:
             if self.verbose:
                 print(f"         Using batch size {batch_size:,} for {n_valid:,} valid edges")
 
-        all_rows = []
-        all_cols = []
-        all_data = []
+        # Preserve the current empty-input failure contract.
+        if n_valid == 0:
+            raise ValueError("need at least one array to concatenate")
+
+        final_rows = np.empty(2 * n_valid, dtype=np.int32)
+        final_cols = np.empty(2 * n_valid, dtype=np.int32)
+        final_data = np.empty(2 * n_valid, dtype=distances.dtype)
 
         for start in range(0, n_valid, batch_size):
             end = min(start + batch_size, n_valid)
             batch_idx = valid_indices[start:end]
 
-            # Direct array slicing instead of list comprehension
-            batch_edges = edge_arr[batch_idx]  # shape (batch, 2)
+            batch_edges = edge_arr[batch_idx]
             batch_dists = distances[batch_idx]
 
-            k = len(batch_idx)
-            row_block = np.empty(2 * k, dtype=np.int32)
-            col_block = np.empty(2 * k, dtype=np.int32)
-            data_block = np.repeat(batch_dists, 2)
+            out_start = 2 * start
+            out_end = 2 * end
 
-            # Use array slicing for efficiency
-            row_block[0::2] = batch_edges[:, 0]
-            row_block[1::2] = batch_edges[:, 1]
-            col_block[0::2] = batch_edges[:, 1]
-            col_block[1::2] = batch_edges[:, 0]
+            final_rows[out_start:out_end:2] = batch_edges[:, 0]
+            final_rows[out_start + 1:out_end:2] = batch_edges[:, 1]
 
-            all_rows.append(row_block)
-            all_cols.append(col_block)
-            all_data.append(data_block)
+            final_cols[out_start:out_end:2] = batch_edges[:, 1]
+            final_cols[out_start + 1:out_end:2] = batch_edges[:, 0]
 
-        final_rows = np.concatenate(all_rows)
-        final_cols = np.concatenate(all_cols)
-        final_data = np.concatenate(all_data)
+            final_data[out_start:out_end:2] = batch_dists
+            final_data[out_start + 1:out_end:2] = batch_dists
 
-        # now use your helper to get a deduped, sorted CSR
         return self._build_csr_from_edge_arrays(final_rows, final_cols, final_data, n)
 
     def extract_mst_edges_boruvka(self, graph, n):
@@ -1007,7 +1029,7 @@ class DataGraphGenerator:
         # Symmetrize, drop diag, finalize
         self.timing.start("create_knn_graph_with_mst.symmetrize")
         G_knn = A.maximum(A.T)
-        G_knn.setdiag(0); G_knn.eliminate_zeros()
+        G_knn.eliminate_zeros()
         G_knn.sort_indices()
         self.timing.end("create_knn_graph_with_mst.symmetrize")
 
@@ -1951,7 +1973,14 @@ class DataGraphGenerator:
                           smooth_before_prune=False, preserve_mst=True,
                           log_timing=True, missing_weight=np.inf, use_approximate_nn=False):
         """
-        Full pipeline to build and refine the DataGraph object with detailed timing statistics
+        Full pipeline to build and refine the DataGraph object.
+
+        This creates a KNN+MST candidate graph, iteratively prunes and optionally
+        smooths it with two-hop candidates, computes connected components, and
+        returns a ``DataGraph`` plus timing/provenance details. It intentionally
+        does not persist a coarsening hierarchy today; the active Step 09
+        Leiden/Louvain path recomputes pre-community coarsening inside
+        ``OptimizedCommunityAnalyzer``.
         
         Parameters:
         -----------

@@ -20,6 +20,7 @@ import os
 import time
 import json
 import pickle
+import hashlib
 import multiprocessing as mp
 from functools import partial, lru_cache
 from collections import defaultdict, Counter
@@ -35,11 +36,19 @@ import scipy.sparse as sp
 from sklearn.metrics import normalized_mutual_info_score
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from data_graph.first_coarsening_core import (
+    aggregate_undirected_edges_with_dist_chunked,
+    mutual_nn_coarsening_directed,
+    sparsify_knn_undirected,
+)
+
 try:
     from tqdm.auto import tqdm
 except ImportError:
     # Simple tqdm fallback if not installed
     def tqdm(iterable, **kwargs):
+        """Return the iterable unchanged when tqdm is unavailable."""
         return iterable
 import click
 import numba as nb
@@ -57,6 +66,7 @@ class PerformanceMonitor:
     """Performance monitoring with minimal overhead."""
     
     def __init__(self, enabled=True):
+        """Initialize timing state and optionally enable timed contexts."""
         self.enabled = enabled
         self.reset()
     
@@ -119,6 +129,7 @@ import scipy.sparse as sp
 
 @nb.njit(cache=True)
 def _build_csr_arrays_from_pairs(a, b, w, n):
+    """Build symmetric CSR arrays from unique undirected edge pairs."""
     # a<b, unique; all dtypes already int32/float32
     deg = np.zeros(n, np.int32)
     m = a.size
@@ -144,6 +155,7 @@ def _build_csr_arrays_from_pairs(a, b, w, n):
     return indptr, indices, data
 
 def _csr_from_undirected_edges(a, b, w, n_nodes):
+    """Create a sorted symmetric CSR matrix from unique ``a < b`` edge arrays."""
     a = a.astype(np.int32,  copy=False)
     b = b.astype(np.int32,  copy=False)
     w = w.astype(np.float32, copy=False)  # use float32 to avoid internal upcasts
@@ -156,6 +168,7 @@ def _csr_from_undirected_edges(a, b, w, n_nodes):
     return csr
 
 def _prepare_threads_for_sknetwork(force_omp=None):
+    """Set thread environment variables before calling scikit-network kernels."""
     import os
     # Figure out how many CPUs Slurm gave you
     cpus = int(
@@ -174,27 +187,6 @@ def _prepare_threads_for_sknetwork(force_omp=None):
     # Let Leiden scale
     os.environ["OMP_NUM_THREADS"] = str(omp_threads)
 
-@nb.njit(cache=True)  # NOTE: no parallel=True
-def mutual_nn_coarsening_directed(sources, targets, weights, n_nodes):
-    best_neighbor = np.full(n_nodes, -1, dtype=np.int64)
-    best_weight   = np.full(n_nodes, -np.inf)
-    for e in range(sources.shape[0]):
-        u = sources[e]; v = targets[e]; w = weights[e]
-        if w > best_weight[u]:
-            best_weight[u] = w; best_neighbor[u] = v
-        if w > best_weight[v]:
-            best_weight[v] = w; best_neighbor[v] = u
-
-    meta_id = np.full(n_nodes, -1, dtype=np.int64)
-    next_id = 0
-    for i in range(n_nodes):
-        j = best_neighbor[i]
-        if j > i and j >= 0 and best_neighbor[j] == i and meta_id[i] == -1:
-            meta_id[i] = next_id; meta_id[j] = next_id; next_id += 1
-    for i in range(n_nodes):
-        if meta_id[i] == -1:
-            meta_id[i] = next_id; next_id += 1
-    return meta_id, next_id
 
 @nb.njit(cache=True)
 def aggregate_undirected_edges_with_dist(s, t, w, d):
@@ -250,75 +242,6 @@ def aggregate_undirected_edges_with_dist(s, t, w, d):
     return out_a[:out], out_b[:out], out_w[:out], out_d[:out]
 
 # ---- paste this helper once (near your Numba helpers) ----
-def aggregate_undirected_edges_with_dist_chunked(s, t, w, d, chunk=8_000_000):
-    """Memory-safe aggregation to UNIQUE undirected pairs a<b.
-    Weight = SUM of weights; distance = MIN of distances.
-    Splits into chunks, sorts/dedups each chunk, concatenates,
-    then final dedup via your numba dedup.
-    """
-    n = s.shape[0]
-    if n == 0:
-        return (s.astype(np.int64), t.astype(np.int64),
-                w.astype(w.dtype), d.astype(d.dtype))
-
-    outs_a, outs_b, outs_w, outs_d = [], [], [], []
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n)
-
-        a = s[start:end].astype(np.int64, copy=False)
-        b = t[start:end].astype(np.int64, copy=False)
-        ww = w[start:end].astype(w.dtype, copy=True)
-        dd = d[start:end].astype(d.dtype, copy=True)
-
-        # canonicalize to a<b
-        mask = a > b
-        if mask.any():
-            a2 = a.copy(); b2 = b.copy()
-            a2[mask] = b[mask]; b2[mask] = a[mask]
-            a, b = a2, b2
-
-        # sort by packed key
-        keys  = (a << 32) | b
-        order = np.argsort(keys)
-        a = a[order]; b = b[order]; ww = ww[order]; dd = dd[order]
-
-        # in-chunk combine (sum weights, min dist)
-        ua = [a[0]]; ub = [b[0]]; uw = [ww[0]]; ud = [dd[0]]
-        for i in range(1, a.size):
-            if a[i] == ua[-1] and b[i] == ub[-1]:
-                uw[-1] += ww[i]
-                if dd[i] < ud[-1]:
-                    ud[-1] = dd[i]
-            else:
-                ua.append(a[i]); ub.append(b[i]); uw.append(ww[i]); ud.append(dd[i])
-
-        outs_a.append(np.asarray(ua, dtype=np.int64))
-        outs_b.append(np.asarray(ub, dtype=np.int64))
-        outs_w.append(np.asarray(uw, dtype=ww.dtype))
-        outs_d.append(np.asarray(ud, dtype=dd.dtype))
-
-    # concatenate chunk results and final dedup (maxw/mind == sum/mind works when each (a,b) appears once per chunk)
-    A = np.concatenate(outs_a); B = np.concatenate(outs_b)
-    W = np.concatenate(outs_w); D = np.concatenate(outs_d)
-    # final dedup: we want SUM weights, MIN distance. Use your existing combiner semantics.
-    # dedup_undirected_maxw_mind does MAX for weights; we want SUM → do a tiny local pass:
-    keys = (A << 32) | B
-    order = np.argsort(keys)
-    A = A[order]; B = B[order]; W = W[order]; D = D[order]
-
-    out_a = [A[0]]; out_b = [B[0]]; out_w = [W[0]]; out_d = [D[0]]
-    for i in range(1, A.size):
-        if A[i] == out_a[-1] and B[i] == out_b[-1]:
-            out_w[-1] += W[i]
-            if D[i] < out_d[-1]:
-                out_d[-1] = D[i]
-        else:
-            out_a.append(A[i]); out_b.append(B[i]); out_w.append(W[i]); out_d.append(D[i])
-
-    return (np.asarray(out_a, dtype=np.int64),
-            np.asarray(out_b, dtype=np.int64),
-            np.asarray(out_w, dtype=W.dtype),
-            np.asarray(out_d, dtype=D.dtype))
 
 
 @nb.njit(cache=True)
@@ -371,79 +294,6 @@ def dedup_undirected_maxw_mind(sel_u, sel_v, sel_w, sel_d):
     return out_a[:out], out_b[:out], out_w[:out], out_d[:out]
 
 
-@nb.njit(cache=True)
-def sparsify_knn_undirected(a, b, w, d, n_nodes, k):
-    """
-    Top-k per node on an undirected graph given unique pairs (a<b).
-    Returns unique pairs (a'<b') chosen by OR of endpoint selections.
-    """
-    m = a.shape[0]
-    # degrees
-    deg = np.zeros(n_nodes, dtype=np.int64)
-    for i in range(m):
-        deg[a[i]] += 1
-        deg[b[i]] += 1
-
-    # row pointers for local 2m storage
-    ptr = np.empty(n_nodes + 1, dtype=np.int64)
-    ptr[0] = 0
-    for i in range(n_nodes):
-        ptr[i+1] = ptr[i] + deg[i]
-    total = ptr[-1]  # 2m
-
-    nbr  = np.empty(total, dtype=np.int64)
-    wts  = np.empty(total, dtype=np.float32)
-    dst  = np.empty(total, dtype=np.float32)
-
-    fill = ptr[:-1].copy()
-    for i in range(m):
-        u = a[i]; v = b[i]; wt = w[i]; di = d[i]
-        pu = fill[u]; nbr[pu] = v; wts[pu] = wt; dst[pu] = di; fill[u] = pu + 1
-        pv = fill[v]; nbr[pv] = u; wts[pv] = wt; dst[pv] = di; fill[v] = pv + 1
-
-    # pre-count selections
-    sel_count = 0
-    for u in range(n_nodes):
-        du = ptr[u+1] - ptr[u]
-        if du > 0:
-            sel_count += k if du > k else du
-
-    cand_u = np.empty(sel_count, dtype=np.int64)
-    cand_v = np.empty(sel_count, dtype=np.int64)
-    cand_w = np.empty(sel_count, dtype=np.float32)
-    cand_d = np.empty(sel_count, dtype=np.float32)
-
-    out = 0
-    for u in range(n_nodes):
-        start = ptr[u]; end = ptr[u+1]; du = end - start
-        if du == 0:
-            continue
-
-        if du <= k:
-            for j in range(du):
-                v = nbr[start + j]
-                cand_u[out] = u; cand_v[out] = v
-                cand_w[out] = wts[start + j]; cand_d[out] = dst[start + j]
-                out += 1
-        else:
-            # simple O(du*k) selector; after coarsening du is modest
-            tmp_w = wts[start:end].copy()
-            tmp_i = np.empty(k, dtype=np.int64)
-            for t in range(k):
-                mi = 0; mw = tmp_w[0]
-                for r in range(1, du):
-                    if tmp_w[r] > mw:
-                        mi = r; mw = tmp_w[r]
-                tmp_i[t] = mi; tmp_w[mi] = np.float32(-1e38)
-            for t in range(k):
-                j = tmp_i[t]
-                v = nbr[start + j]
-                cand_u[out] = u; cand_v[out] = v
-                cand_w[out] = wts[start + j]; cand_d[out] = dst[start + j]
-                out += 1
-
-    # OR-of-endpoints, dedup to unique (a<b)
-    return dedup_undirected_maxw_mind(cand_u[:out], cand_v[:out], cand_w[:out], cand_d[:out])
 
 # ------------------------------------------------------------------------
 # NUMBA KERNEL
@@ -457,6 +307,7 @@ def _accumulate_stats(
     cidx:       np.ndarray,  # cluster_indices per node
     n_clusters: int
 ):
+    """Accumulate per-cluster weighted cut, volume, and distance summaries."""
     # allocate accumulators
     vol       = np.zeros(n_clusters, dtype=np.float32)
     cut       = np.zeros(n_clusters, dtype=np.float32)
@@ -720,6 +571,7 @@ class OptimizedGraphLoader:
     """Memory-efficient graph loader with on-disk caching and lazy I/O."""
 
     def __init__(self, input_dir: str):
+        """Bind a saved DataGraph directory and prepare CSR structure caches."""
         self.input_dir = input_dir
         self._metadata = None
         self._node_df = None
@@ -750,6 +602,7 @@ class OptimizedGraphLoader:
         
     @property
     def metadata(self) -> Dict:
+        """Load saved graph metadata from ``metadata.json`` if present."""
         if self._metadata is None:
             with perf_monitor.timed_operation("Load metadata"):
                 path = os.path.join(self.input_dir, "metadata.json")
@@ -762,6 +615,7 @@ class OptimizedGraphLoader:
 
     @property
     def node_df(self) -> pd.DataFrame:
+        """Load the saved node dataframe."""
         if self._node_df is None:
             with perf_monitor.timed_operation("Load node dataframe"):
                 self._node_df = pd.read_parquet(
@@ -771,6 +625,7 @@ class OptimizedGraphLoader:
 
     @property
     def component_labels(self) -> np.ndarray:
+        """Load connected-component labels or synthesize a single component."""
         if self._component_labels is None:
             with perf_monitor.timed_operation("Load component labels"):
                 path = os.path.join(self.input_dir, "component_labels.npy")
@@ -783,6 +638,7 @@ class OptimizedGraphLoader:
 
     @property
     def means(self) -> Optional[np.ndarray]:
+        """Load optional saved mean vectors when metadata says they exist."""
         if self._means is None and self.metadata.get("has_means", False):
             with perf_monitor.timed_operation("Load means"):
                 self._means = np.load(os.path.join(self.input_dir, "means.npy"))
@@ -790,6 +646,7 @@ class OptimizedGraphLoader:
 
     @property
     def sigmas(self) -> Optional[np.ndarray]:
+        """Load optional saved sigma vectors when metadata says they exist."""
         if self._sigmas is None and self.metadata.get("has_sigmas", False):
             with perf_monitor.timed_operation("Load sigmas"):
                 self._sigmas = np.load(os.path.join(self.input_dir, "sigmas.npy"))
@@ -797,6 +654,7 @@ class OptimizedGraphLoader:
 
     @property
     def embedding(self) -> Optional[np.ndarray]:
+        """Load the primary saved embedding array if present."""
         if self._embedding is None:
             with perf_monitor.timed_operation("Load embedding"):
                 path = os.path.join(self.input_dir, "embedding.npy")
@@ -806,6 +664,7 @@ class OptimizedGraphLoader:
 
     @property
     def full_embedding(self) -> Optional[np.ndarray]:
+        """Load the optional full embedding array if present."""
         if self._full_embedding is None:
             with perf_monitor.timed_operation("Load full embedding"):
                 path = os.path.join(self.input_dir, "full_embedding.npy")
@@ -815,6 +674,7 @@ class OptimizedGraphLoader:
 
     @property
     def umap_results(self) -> Optional[Dict]:
+        """Assemble UMAP-style embedding metadata for visualization helpers."""
         if self._umap_results is None and self.embedding is not None:
             with perf_monitor.timed_operation("Build UMAP results"):
                 self._umap_results = {
@@ -832,6 +692,7 @@ class OptimizedGraphLoader:
 
     @property
     def adjacency(self) -> sp.spmatrix:
+        """Load the saved sparse graph adjacency matrix."""
         if self._adjacency is None:
             with perf_monitor.timed_operation("Load adjacency matrix"):
                 path = os.path.join(self.input_dir, "graph_adjacency.npz")
@@ -868,10 +729,12 @@ class OptimizedGraphLoader:
 
     @property
     def n_nodes(self) -> int:
+        """Return the number of nodes represented by the saved dataframe."""
         return len(self.node_df)
 
     @property
     def n_edges(self) -> int:
+        """Return the number of directed edge-array entries available."""
         return len(self.edge_arrays[0])
 
     def build_graph_wrapper(self, include_embedding: bool = True):
@@ -880,7 +743,10 @@ class OptimizedGraphLoader:
         so you can plug into DataGraph or similar.
         """
         class GraphWrapper:
+            """Small adapter matching the subset of DataGraph used downstream."""
+
             def __init__(self, loader):
+                """Copy node metadata and expose a minimal edge-list graph API."""
                 self.loader = loader
                 self.node_df = loader.node_df.copy()
                 if include_embedding and loader.embedding is not None and loader.embedding.shape[1] >= 2:
@@ -902,8 +768,114 @@ class OptimizedGraphLoader:
 # OPTIMIZED COMMUNITY ANALYZER
 # ============================================================================
 
+
+@njit(cache=True)
+def _count_interface_edges_materialize_fast(
+    sources,
+    targets,
+    clusters,
+    is_pruned,
+    max_pruned,
+):
+    interface_count = 0
+    cross_count = 0
+    pruned_count = 0
+
+    for idx in range(sources.shape[0]):
+        ci = clusters[sources[idx]]
+        cj = clusters[targets[idx]]
+
+        if ci != cj:
+            interface_count += 1
+            cross_count += 1
+
+        elif (
+            (ci <= max_pruned and is_pruned[ci])
+            or (cj <= max_pruned and is_pruned[cj])
+        ):
+            interface_count += 1
+            pruned_count += 1
+
+    return interface_count, cross_count, pruned_count
+
+
+@njit(cache=True)
+def _fill_interface_edges_materialize_fast(
+    sources,
+    targets,
+    distances,
+    clusters,
+    is_pruned,
+    max_pruned,
+    out_sources,
+    out_targets,
+    out_distances,
+    out_source_clusters,
+    out_target_clusters,
+    out_edge_types,
+    offset,
+):
+    pos = offset
+
+    for idx in range(sources.shape[0]):
+        i = sources[idx]
+        j = targets[idx]
+
+        ci = clusters[i]
+        cj = clusters[j]
+
+        if ci != cj:
+            out_sources[pos] = i
+            out_targets[pos] = j
+            out_distances[pos] = distances[idx]
+            out_source_clusters[pos] = ci
+            out_target_clusters[pos] = cj
+            out_edge_types[pos] = 0
+            pos += 1
+
+        elif (
+            (ci <= max_pruned and is_pruned[ci])
+            or (cj <= max_pruned and is_pruned[cj])
+        ):
+            out_sources[pos] = i
+            out_targets[pos] = j
+            out_distances[pos] = distances[idx]
+            out_source_clusters[pos] = ci
+            out_target_clusters[pos] = cj
+            out_edge_types[pos] = 1
+            pos += 1
+
+    return pos
+
+
+
+def _get_adaptive_similarity_scale_fast(self, distances):
+    cached = getattr(
+        self,
+        "_adaptive_similarity_scale_cache",
+        None,
+    )
+
+    if cached is not None and cached[0] is distances:
+        return cached[1]
+
+    scale = float(np.median(distances))
+    self._adaptive_similarity_scale_cache = (
+        distances,
+        scale,
+    )
+    return scale
+
+
 class OptimizedCommunityAnalyzer:
-    """Optimized community detection with minimal memory footprint."""
+    """CSR-native community analysis with optional sparsify/coarsen preparation.
+
+    A single analyzer lazily prepares its working graph once, then reuses the
+    prepared arrays for subsequent resolutions in that process. Fresh analyzer
+    construction still recomputes pre-coarsening sparsification and coarsening;
+    set ``prepared_graph_cache=True`` to persist and reuse exact-compatible
+    prepared arrays across analyzer instances.
+    """
     
     def __init__(self, graph_loader: OptimizedGraphLoader,
                  coarsen: bool = True,
@@ -912,22 +884,42 @@ class OptimizedCommunityAnalyzer:
                  sparsify_pre_k: int = 60,
                  sparsify_post_k: int = 60,
                  similarity_function=None,
+                 prepared_graph_cache: bool = True,
+                 prepared_graph_cache_dir: Optional[str] = None,
+                 prepared_graph_cache_key: Optional[str] = None,
+                 prepared_graph_cache_read: bool = True,
+                 prepared_graph_cache_write: bool = True,
+                 coarsening_stack_cache: bool = True,
+                 coarsening_stack_cache_write: bool = True,
                  verbose: bool = True):
+        """Load edge arrays and configure lazy community-detection preparation."""
         # Warm up numba function to prepare for bottleneck        
         self.coarsen = coarsen
         self.coarsen_levels = coarsen_levels
         self.sparsify = sparsify
         self.sparsify_pre_k = sparsify_pre_k
         self.sparsify_post_k = sparsify_post_k
+        self._requested_sparsify_post_k = sparsify_post_k
         self.verbose = verbose
         self._csr_offsets = None
         self._csr_indices = None
+        self.prepared_graph_cache = prepared_graph_cache
+        self.prepared_graph_cache_dir = prepared_graph_cache_dir
+        self.prepared_graph_cache_key = prepared_graph_cache_key
+        self.prepared_graph_cache_read = prepared_graph_cache_read
+        self.prepared_graph_cache_write = prepared_graph_cache_write
+        self.coarsening_stack_cache = coarsening_stack_cache
+        self.coarsening_stack_cache_write = coarsening_stack_cache_write
+        self._prepared_graph_cache_schema = 1
+        self._coarsening_stack_schema = 2
 
         # Default similarity function
         if similarity_function is None:
             self.similarity_function = lambda d, s=None: self._gaussian_similarity(d, s)
+            self._similarity_cache_identity = "default_gaussian"
         else:
             self.similarity_function = similarity_function
+            self._similarity_cache_identity = prepared_graph_cache_key
 
         # Storage for results
         self.runs = {}
@@ -986,17 +978,21 @@ class OptimizedCommunityAnalyzer:
                 
     @property
     def csr_offsets(self):
+        """Return cached CSR row offsets for the prepared graph."""
         return self._csr_offsets
 
     @property
     def csr_indices(self):
+        """Return cached CSR column indices for the prepared graph."""
         return self._csr_indices
 
     @property
     def n_edges(self) -> int:
+        """Return the number of edge-array entries currently exposed."""
         return len(self.edge_arrays[0])
     
     def _ensure_csr_built(self):
+        """Load or build cached CSR offsets and indices for interface scans."""
         if not self._csr_built:
             if self.verbose:
                 print("Loading CSR graph structure from cache...")
@@ -1006,22 +1002,61 @@ class OptimizedCommunityAnalyzer:
             self._csr_built = True
 
     def _ensure_prepared(self):
-        """Ensure graph is prepared—coarsening before sparsification—when needed."""
+        """Prepare sparsified/coarsened arrays before community detection."""
         if not self._graph_prepared:
+            if self._load_prepared_graph_cache():
+                self._graph_prepared = True
+                self._initialized = True
+                return
+
+            _resume_state = (
+                self._select_coarsening_resume_state()
+                if self.coarsen
+                else None
+            )
+
             if self.verbose:
                 print("Preparing graph…")
 
-            # 1) Apply pre-coarsening sparsification so edge aggregation is less demanding
-            if self.sparsify:
-                if self.verbose:
-                    print("  Pre-coarsening sparsification step")
-                self._apply_pre_coarsening_sparsification()
+            # 1) Fresh preparation performs pre-coarsening sparsification once.
+            # A restored prefix is already post-pre-sparsification and must not
+            # repeat this work.
+            if _resume_state is None:
+                if self.sparsify:
+                    if self.verbose:
+                        print("  Pre-coarsening sparsification step")
+                    self._apply_pre_coarsening_sparsification()
+                if self.coarsen:
+                    base_weights = self._compute_similarities(self.distances).astype(np.float32, copy=False)
+                    self._save_coarsening_stack_level(
+                        level=0,
+                        level_kind="pre_coarsening",
+                        n_nodes=self.loader.n_nodes,
+                        sources=self.sources,
+                        targets=self.targets,
+                        distances=self.distances,
+                        weights=base_weights,
+                        cumulative_mapping=np.arange(self.loader.n_nodes, dtype=np.int64),
+                        local_mapping=None,
+                        k_prev=self.sparsify_pre_k,
+                        reduction_ratio=1.0,
+                    )
 
-            # 2) Apply coarsening so everything downstream sees the reduced graph
+            # 2) Apply coarsening so everything downstream sees the reduced graph.
+            # Exact final prepared-cache reuse has already been attempted above;
+            # on a miss, resume from the deepest compatible stack prefix when
+            # available, otherwise use the unchanged fresh path.
             if self.coarsen:
                 if self.verbose:
-                    print("  → Coarsening step")
-                self._apply_coarsening()
+                    if _resume_state is None:
+                        print("  → Coarsening step")
+                    else:
+                        print(
+                            "  → Coarsening step "
+                            f"(resume level {_resume_state['level']}, "
+                            f"terminal={bool(_resume_state['terminal'])})"
+                        )
+                self._apply_coarsening(_resume_state=_resume_state)
                
             # NOTE: Conversion to igraph is unnecessary...
             if False:
@@ -1034,8 +1069,509 @@ class OptimizedCommunityAnalyzer:
             # Mark as done
             self._graph_prepared = True
             self._initialized     = True
+            self._save_prepared_graph_cache()
+
+    def _prepared_cache_base_dir(self) -> Optional[str]:
+        """Return the directory used for opt-in prepared graph caches."""
+        if not self.prepared_graph_cache:
+            return None
+        if self._similarity_cache_identity is None:
+            if self.verbose:
+                print("Prepared graph cache disabled: custom similarity function needs prepared_graph_cache_key.")
+            return None
+        if self.prepared_graph_cache_dir is not None:
+            return self.prepared_graph_cache_dir
+        input_dir = getattr(self.loader, "input_dir", None)
+        if input_dir is None:
+            return None
+        return os.path.join(input_dir, "prepared_graph_cache")
+
+    @staticmethod
+    def _file_signature(path: str) -> Optional[Dict[str, Any]]:
+        """Return a cheap file signature for cache compatibility checks."""
+        if not path or not os.path.exists(path):
+            return None
+        stat = os.stat(path)
+        return {
+            "path": os.path.basename(path),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    def _prepared_cache_spec(self) -> Optional[Dict[str, Any]]:
+        """Build the compatibility metadata and cache file paths."""
+        base_dir = self._prepared_cache_base_dir()
+        if base_dir is None:
+            return None
+
+        input_dir = getattr(self.loader, "input_dir", None)
+        graph_sig = None
+        edge_sig = None
+        metadata_sig = None
+        if input_dir is not None:
+            graph_sig = self._file_signature(os.path.join(input_dir, "graph_adjacency.npz"))
+            edge_sig = self._file_signature(os.path.join(input_dir, "edge_arrays.npz"))
+            metadata_sig = self._file_signature(os.path.join(input_dir, "metadata.json"))
+
+        compat = {
+            "schema": self._prepared_graph_cache_schema,
+            "n_nodes": int(self.loader.n_nodes),
+            "n_edges": int(len(self.full_sources)),
+            "coarsen": bool(self.coarsen),
+            "coarsen_levels": int(self.coarsen_levels),
+            "sparsify": bool(self.sparsify),
+            "sparsify_pre_k": None if self.sparsify_pre_k is None else int(self.sparsify_pre_k),
+            "sparsify_post_k_requested": (
+                None if self._requested_sparsify_post_k is None
+                else int(self._requested_sparsify_post_k)
+            ),
+            "similarity": self._similarity_cache_identity,
+            "graph_adjacency": graph_sig,
+            "edge_arrays": edge_sig,
+            "metadata": metadata_sig,
+            "user_key": self.prepared_graph_cache_key,
+        }
+        payload = json.dumps(compat, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        cache_key = hashlib.sha256(payload).hexdigest()[:24]
+        return {
+            "base_dir": base_dir,
+            "cache_key": cache_key,
+            "compat": compat,
+            "data_path": os.path.join(base_dir, f"prepared_graph_{cache_key}.npz"),
+            "meta_path": os.path.join(base_dir, f"prepared_graph_{cache_key}.json"),
+        }
+
+    @staticmethod
+    def _compact_int_array(values: np.ndarray) -> np.ndarray:
+        """Store ID arrays as int32 when possible."""
+        arr = np.asarray(values)
+        if arr.size == 0:
+            return arr.astype(np.int32, copy=False)
+        if arr.min() >= np.iinfo(np.int32).min and arr.max() <= np.iinfo(np.int32).max:
+            return arr.astype(np.int32, copy=False)
+        return arr.astype(np.int64, copy=False)
+
+    def _coarsening_stack_spec(self) -> Optional[Dict[str, Any]]:
+        """Build metadata and paths for the reusable coarsening prefix stack."""
+        if not (self.prepared_graph_cache and self.coarsening_stack_cache):
+            return None
+        prepared_spec = self._prepared_cache_spec()
+        if prepared_spec is None:
+            return None
+
+        compat = dict(prepared_spec["compat"])
+        compat.update({
+            "schema": self._coarsening_stack_schema,
+            "cache_kind": "coarsening_stack",
+            "coarsening_algorithm": "mutual_nn_directed_v1",
+            "aggregation": "sum_weights_min_distance_v1",
+        })
+        compat.pop("coarsen_levels", None)
+        compat.pop("sparsify_post_k_requested", None)
+        payload = json.dumps(compat, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        stack_key = hashlib.sha256(payload).hexdigest()[:24]
+        stack_dir = os.path.join(prepared_spec["base_dir"], f"coarsening_stack_{stack_key}")
+        return {
+            "stack_key": stack_key,
+            "compat": compat,
+            "stack_dir": stack_dir,
+            "manifest_path": os.path.join(stack_dir, "manifest.json"),
+        }
+
+    def _load_coarsening_stack_manifest(self) -> Optional[Dict[str, Any]]:
+        """Load the coarsening-stack manifest when it matches this graph/config."""
+        spec = self._coarsening_stack_spec()
+        if spec is None or not os.path.exists(spec["manifest_path"]):
+            return None
+        try:
+            with open(spec["manifest_path"], "r") as f:
+                manifest = json.load(f)
+            if manifest.get("stack_key") != spec["stack_key"] or manifest.get("compat") != spec["compat"]:
+                return None
+            return manifest
+        except Exception:
+            return None
+
+    def _save_coarsening_stack_level(
+        self,
+        *,
+        level: int,
+        level_kind: str,
+        n_nodes: int,
+        sources: np.ndarray,
+        targets: np.ndarray,
+        distances: np.ndarray,
+        weights: np.ndarray,
+        cumulative_mapping: np.ndarray,
+        local_mapping: Optional[np.ndarray] = None,
+        k_prev: Optional[int] = None,
+        reduction_ratio: Optional[float] = None,
+        terminal: bool = False,
+        terminal_reason: Optional[str] = None,
+    ) -> None:
+        """Persist one recoverable coarsening-prefix level."""
+        if not (self.prepared_graph_cache and self.coarsening_stack_cache and self.coarsening_stack_cache_write):
+            return
+        spec = self._coarsening_stack_spec()
+        if spec is None:
+            return
+
+        os.makedirs(spec["stack_dir"], exist_ok=True)
+        level_name = f"level_{int(level):03d}.npz"
+        level_path = os.path.join(spec["stack_dir"], level_name)
+        tmp_level_path = level_path + ".tmp.npz"
+        manifest_path = spec["manifest_path"]
+        tmp_manifest_path = manifest_path + ".tmp"
+
+        has_local_mapping = local_mapping is not None
+        local_values = (
+            self._compact_int_array(local_mapping)
+            if has_local_mapping
+            else np.empty(0, dtype=np.int32)
+        )
+        entry = {
+            "level": int(level),
+            "kind": level_kind,
+            "file": level_name,
+            "n_nodes": int(n_nodes),
+            "n_edges": int(len(sources)),
+            "has_local_mapping": bool(has_local_mapping),
+            "k_prev": None if k_prev is None else int(k_prev),
+            "reduction_ratio": None if reduction_ratio is None else float(reduction_ratio),
+            "terminal": bool(terminal),
+            "terminal_reason": None if terminal_reason is None else str(terminal_reason),
+            "post_final_sparsified": False,
+        }
+
+        try:
+            np.savez_compressed(
+                tmp_level_path,
+                sources=self._compact_int_array(sources),
+                targets=self._compact_int_array(targets),
+                distances=np.asarray(distances, dtype=np.float32),
+                weights=np.asarray(weights, dtype=np.float32),
+                cumulative_mapping=self._compact_int_array(cumulative_mapping),
+                local_mapping=local_values,
+            )
+            os.replace(tmp_level_path, level_path)
+
+            manifest = self._load_coarsening_stack_manifest()
+            if manifest is None:
+                manifest = {
+                    "stack_key": spec["stack_key"],
+                    "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "compat": spec["compat"],
+                    "levels": [],
+                }
+            levels = [item for item in manifest.get("levels", []) if int(item.get("level", -1)) != int(level)]
+            levels.append(entry)
+            manifest["levels"] = sorted(levels, key=lambda item: int(item["level"]))
+            manifest["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            with open(tmp_manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2, sort_keys=True)
+            os.replace(tmp_manifest_path, manifest_path)
+        except Exception as exc:
+            for path in (tmp_level_path, tmp_manifest_path):
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            if self.verbose:
+                print(f"Coarsening stack level save failed ({exc}); continuing without stack level.")
+
+    def list_coarsening_levels(self) -> List[Dict[str, Any]]:
+        """Return metadata for cached coarsening-prefix levels."""
+        manifest = self._load_coarsening_stack_manifest()
+        if manifest is None:
+            return []
+        return list(manifest.get("levels", []))
+
+    def _select_coarsening_resume_state(self) -> Optional[Dict[str, Any]]:
+        """Return the deepest compatible cached prefix for automatic resume.
+
+        Exact final prepared-cache reuse is handled before this method. Automatic
+        prefix reads honor ``prepared_graph_cache_read``; manual stack inspection
+        through ``list_coarsening_levels``/``get_coarsening_level`` remains
+        available independently.
+        """
+        if not (
+            self.prepared_graph_cache
+            and self.prepared_graph_cache_read
+            and self.coarsening_stack_cache
+            and self.coarsen
+        ):
+            return None
+
+        try:
+            raw_levels = self.list_coarsening_levels()
+            requested_level = int(self.coarsen_levels)
+            by_level = {
+                int(item["level"]): dict(item)
+                for item in raw_levels
+                if 0 <= int(item.get("level", -1)) <= requested_level
+            }
+            if 0 not in by_level:
+                return None
+
+            # Only prefixes with a complete 0..L lineage can reconstruct the
+            # coarsening hierarchy exactly. A gap makes deeper entries unsafe.
+            contiguous_levels = []
+            for level in range(requested_level + 1):
+                if level not in by_level:
+                    break
+                contiguous_levels.append(level)
+
+            required = {
+                "level",
+                "sources",
+                "targets",
+                "distances",
+                "weights",
+                "n_nodes",
+                "cumulative_mapping",
+                "k_prev",
+                "terminal",
+                "terminal_reason",
+            }
+
+            for level in reversed(contiguous_levels):
+                try:
+                    state = dict(
+                        self.get_coarsening_level(
+                            level,
+                            include_edges=True,
+                        )
+                    )
+                    missing = sorted(required - set(state))
+                    if missing:
+                        raise ValueError(
+                            "cached prefix is missing resume fields: "
+                            + ", ".join(missing)
+                        )
+
+                    hierarchy = []
+                    for completed_level in range(1, level + 1):
+                        previous = by_level[completed_level - 1]
+                        current = by_level[completed_level]
+                        ratio = current.get("reduction_ratio")
+                        if ratio is None:
+                            raise ValueError(
+                                "cached prefix is missing reduction_ratio "
+                                f"at level {completed_level}"
+                            )
+                        hierarchy.append({
+                            "level": completed_level - 1,
+                            "original_nodes": int(previous["n_nodes"]),
+                            "coarsened_nodes": int(current["n_nodes"]),
+                            "reduction_ratio": float(ratio),
+                        })
+
+                    state["coarsening_hierarchy"] = hierarchy
+                    return state
+                except Exception as exc:
+                    if self.verbose:
+                        print(
+                            f"Coarsening stack level {level} is not resumable "
+                            f"({exc}); trying a shallower prefix."
+                        )
+        except Exception as exc:
+            if self.verbose:
+                print(
+                    f"Coarsening stack resume selection failed ({exc}); "
+                    "recomputing from scratch."
+                )
+
+        return None
+
+    def get_coarsening_level(self, level: int, include_edges: bool = True) -> Dict[str, Any]:
+        payload = self._get_coarsening_level_payload(
+            level, include_edges=include_edges
+        )
+        metadata = next(
+            (
+                item
+                for item in self.list_coarsening_levels()
+                if int(item.get("level", -1)) == int(level)
+            ),
+            None,
+        )
+        if metadata is None:
+            return payload
+        enriched = dict(payload)
+        for key in ("level", "n_nodes", "k_prev", "terminal", "terminal_reason"):
+            if key in metadata:
+                enriched[key] = metadata[key]
+        return enriched
+
+    def _get_coarsening_level_payload(self, level: int, include_edges: bool = True) -> Dict[str, Any]:
+        """Load one cached coarsening-prefix level."""
+        spec = self._coarsening_stack_spec()
+        manifest = self._load_coarsening_stack_manifest()
+        if spec is None or manifest is None:
+            raise FileNotFoundError("No compatible coarsening stack cache is available.")
+
+        entry = None
+        for item in manifest.get("levels", []):
+            if int(item.get("level", -1)) == int(level):
+                entry = item
+                break
+        if entry is None:
+            raise KeyError(f"No cached coarsening level {level}.")
+
+        data = np.load(os.path.join(spec["stack_dir"], entry["file"]), allow_pickle=False)
+        result = {
+            "metadata": entry,
+            "cumulative_mapping": np.asarray(data["cumulative_mapping"], dtype=np.int64),
+            "local_mapping": (
+                np.asarray(data["local_mapping"], dtype=np.int64)
+                if entry.get("has_local_mapping", False)
+                else None
+            ),
+        }
+        if include_edges:
+            result.update({
+                "sources": np.asarray(data["sources"], dtype=np.int64),
+                "targets": np.asarray(data["targets"], dtype=np.int64),
+                "distances": np.asarray(data["distances"], dtype=np.float32),
+                "weights": np.asarray(data["weights"], dtype=np.float32),
+            })
+        return result
+
+    @staticmethod
+    def _project_fine_labels_with_mapping(fine_labels: np.ndarray, mapping: np.ndarray, n_level: int) -> np.ndarray:
+        """Project fine labels to a coarsened level by deterministic majority vote."""
+        if fine_labels.shape[0] != mapping.shape[0]:
+            raise ValueError(f"fine_labels has length {fine_labels.shape[0]}, expected {mapping.shape[0]}.")
+        coarse = np.empty(int(n_level), dtype=np.asarray(fine_labels).dtype)
+        order = np.argsort(mapping)
+        meta_sorted = mapping[order]
+        labels_sorted = fine_labels[order]
+        boundaries = np.flatnonzero(
+            np.concatenate((
+                np.array([True]),
+                meta_sorted[1:] != meta_sorted[:-1],
+                np.array([True])
+            ))
+        )
+        for group in range(boundaries.shape[0] - 1):
+            start = boundaries[group]
+            end = boundaries[group + 1]
+            vals, counts = np.unique(labels_sorted[start:end], return_counts=True)
+            coarse[meta_sorted[start]] = vals[np.argmax(counts)]
+        return coarse
+
+    def project_labels_to_level(self, fine_labels: np.ndarray, level: int) -> np.ndarray:
+        """Project fine-node labels to a cached coarsening level."""
+        level_data = self.get_coarsening_level(level, include_edges=False)
+        mapping = level_data["cumulative_mapping"]
+        n_level = int(level_data["metadata"]["n_nodes"])
+        return self._project_fine_labels_with_mapping(np.asarray(fine_labels), mapping, n_level)
+
+    def project_labels_to_fine(self, level_labels: np.ndarray, level: int) -> np.ndarray:
+        """Project labels from a cached coarsening level back to fine nodes."""
+        level_data = self.get_coarsening_level(level, include_edges=False)
+        mapping = level_data["cumulative_mapping"]
+        labels = np.asarray(level_labels)
+        if labels.shape[0] <= int(mapping.max(initial=-1)):
+            raise ValueError(
+                f"level_labels has length {labels.shape[0]}, but level {level} needs "
+                f"at least {int(mapping.max()) + 1} labels."
+            )
+        return labels[mapping]
+
+    def _load_prepared_graph_cache(self) -> bool:
+        """Load cached prepared graph arrays when an exact compatibility match exists."""
+        if not (self.prepared_graph_cache and self.prepared_graph_cache_read):
+            return False
+        spec = self._prepared_cache_spec()
+        if spec is None:
+            return False
+        if not (os.path.exists(spec["data_path"]) and os.path.exists(spec["meta_path"])):
+            return False
+
+        try:
+            with open(spec["meta_path"], "r") as f:
+                meta = json.load(f)
+            if meta.get("cache_key") != spec["cache_key"] or meta.get("compat") != spec["compat"]:
+                if self.verbose:
+                    print("Prepared graph cache metadata mismatch; recomputing.")
+                return False
+            with perf_monitor.timed_operation("Load prepared graph cache"):
+                data = np.load(spec["data_path"], allow_pickle=False)
+                self.coarsened = bool(meta["prepared_state"]["coarsened"])
+                self.n_nodes_final = int(meta["prepared_state"]["n_nodes_final"])
+                self.coarsening_ratio = float(meta["prepared_state"]["coarsening_ratio"])
+                self.sparsify_post_k = meta["prepared_state"].get("sparsify_post_k_final")
+                self.meta_id = np.ascontiguousarray(data["meta_id"].astype(np.int64, copy=False))
+                self.coarsened_sources = np.ascontiguousarray(data["coarsened_sources"].astype(np.int32, copy=False))
+                self.coarsened_targets = np.ascontiguousarray(data["coarsened_targets"].astype(np.int32, copy=False))
+                self.coarsened_weights = np.ascontiguousarray(data["coarsened_weights"].astype(np.float32, copy=False))
+                self.distances = np.ascontiguousarray(data["distances"].astype(np.float32, copy=False))
+                self.coarsened_n_nodes = self.n_nodes_final
+                self.coarsening_hierarchy = meta.get("coarsening_hierarchy", [])
+            if self.verbose:
+                print(f"Loaded prepared graph cache: {spec['data_path']}")
+            return True
+        except Exception as exc:
+            if self.verbose:
+                print(f"Prepared graph cache load failed ({exc}); recomputing.")
+            return False
+
+    def _save_prepared_graph_cache(self) -> None:
+        """Persist prepared graph arrays for later analyzer instances."""
+        if not (self.prepared_graph_cache and self.prepared_graph_cache_write):
+            return
+        spec = self._prepared_cache_spec()
+        if spec is None:
+            return
+
+        os.makedirs(spec["base_dir"], exist_ok=True)
+        tmp_data = spec["data_path"] + ".tmp.npz"
+        tmp_meta = spec["meta_path"] + ".tmp"
+        meta = {
+            "cache_key": spec["cache_key"],
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "compat": spec["compat"],
+            "prepared_state": {
+                "coarsened": bool(self.coarsened),
+                "n_nodes_final": int(self.n_nodes_final),
+                "coarsening_ratio": float(getattr(self, "coarsening_ratio", 1.0)),
+                "sparsify_post_k_final": self.sparsify_post_k,
+            },
+            "coarsening_hierarchy": getattr(self, "coarsening_hierarchy", []),
+        }
+        try:
+            with perf_monitor.timed_operation("Save prepared graph cache"):
+                np.savez_compressed(
+                    tmp_data,
+                    meta_id=np.asarray(
+                        self.meta_id if self.meta_id is not None else np.arange(self.loader.n_nodes),
+                        dtype=np.int64,
+                    ),
+                    coarsened_sources=np.asarray(self.coarsened_sources, dtype=np.int32),
+                    coarsened_targets=np.asarray(self.coarsened_targets, dtype=np.int32),
+                    coarsened_weights=np.asarray(self.coarsened_weights, dtype=np.float32),
+                    distances=np.asarray(self.distances, dtype=np.float32),
+                )
+                with open(tmp_meta, "w") as f:
+                    json.dump(meta, f, indent=2, sort_keys=True)
+                os.replace(tmp_data, spec["data_path"])
+                os.replace(tmp_meta, spec["meta_path"])
+            if self.verbose:
+                print(f"Saved prepared graph cache: {spec['data_path']}")
+        except Exception as exc:
+            for path in (tmp_data, tmp_meta):
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            if self.verbose:
+                print(f"Prepared graph cache save failed ({exc}); continuing without cache.")
     
     def _apply_pre_coarsening_sparsification(self):
+        """Apply directed top-k pruning before reciprocal-neighbor coarsening."""
         if self.verbose:
             print(f"Sparsifying un-coarsened graph (k={self.sparsify_pre_k})…")
         with perf_monitor.timed_operation("Un-coarsened graph sparsification"):
@@ -1099,7 +1635,7 @@ class OptimizedCommunityAnalyzer:
         
         return self._similarity_cache[cache_key]
     
-    def _apply_coarsening(self):
+    def _apply_coarsening(self, *, _resume_state=None):
         """Reciprocal 1-NN coarsening over undirected graph.
         - Each level merges nodes via mutual_nn_coarsening_directed
         - Aggregates to unique undirected (a<b)
@@ -1126,7 +1662,127 @@ class OptimizedCommunityAnalyzer:
         # Start with the configured pre-coarsening k
         k_prev = int(self.sparsify_pre_k)
 
-        for level in range(self.coarsen_levels):
+        # Prefix-resume execution primitive.
+        # A stored level is the graph state after that many completed
+        # coarsening rounds and before final post-coarsening sparsification.
+        _start_level = 0
+        if _resume_state is not None:
+            if not isinstance(_resume_state, dict):
+                raise TypeError("_resume_state must be a dict")
+
+            _required_resume_keys = (
+                "level",
+                "sources",
+                "targets",
+                "distances",
+                "weights",
+                "n_nodes",
+                "cumulative_mapping",
+                "k_prev",
+                "terminal",
+            )
+            _missing_resume_keys = [
+                key for key in _required_resume_keys
+                if key not in _resume_state
+            ]
+            if _missing_resume_keys:
+                raise ValueError(
+                    "Incomplete coarsening resume state; missing: "
+                    + ", ".join(_missing_resume_keys)
+                )
+
+            _start_level = int(_resume_state["level"])
+            if not 0 <= _start_level <= int(self.coarsen_levels):
+                raise ValueError(
+                    "Resume level must satisfy "
+                    "0 <= level <= coarsen_levels"
+                )
+
+            current_sources = np.asarray(_resume_state["sources"])
+            current_targets = np.asarray(_resume_state["targets"])
+            current_distances = np.asarray(_resume_state["distances"])
+            current_weights = np.asarray(_resume_state["weights"])
+            current_n_nodes = int(_resume_state["n_nodes"])
+            cumulative_mapping = np.asarray(
+                _resume_state["cumulative_mapping"]
+            ).copy()
+
+            if current_n_nodes < 0:
+                raise ValueError("Resume n_nodes must be nonnegative")
+
+            _n_edges = current_sources.size
+            if not (
+                current_targets.size == _n_edges
+                and current_distances.size == _n_edges
+                and current_weights.size == _n_edges
+            ):
+                raise ValueError(
+                    "Resume edge arrays must have identical lengths"
+                )
+
+            if cumulative_mapping.ndim != 1:
+                raise ValueError(
+                    "Resume cumulative_mapping must be one-dimensional"
+                )
+
+            if cumulative_mapping.size:
+                if int(cumulative_mapping.min()) < 0:
+                    raise ValueError(
+                        "Resume cumulative_mapping contains negative ids"
+                    )
+                if int(cumulative_mapping.max()) >= current_n_nodes:
+                    raise ValueError(
+                        "Resume cumulative_mapping exceeds n_nodes"
+                    )
+
+            _resume_k_prev = _resume_state["k_prev"]
+            if isinstance(_resume_k_prev, np.ndarray):
+                if _resume_k_prev.size == 0:
+                    _resume_k_prev = None
+                elif _resume_k_prev.size == 1:
+                    _resume_k_prev = _resume_k_prev.reshape(-1)[0].item()
+                else:
+                    raise ValueError(
+                        "Resume k_prev must be scalar or None"
+                    )
+            k_prev = (
+                None
+                if _resume_k_prev is None
+                else int(_resume_k_prev)
+            )
+
+            _resume_terminal = bool(_resume_state["terminal"])
+            _resume_terminal_reason = _resume_state.get("terminal_reason")
+
+            _resume_hierarchy = _resume_state.get(
+                "coarsening_hierarchy"
+            )
+            if _resume_hierarchy is not None:
+                self.coarsening_hierarchy = [
+                    dict(entry) for entry in _resume_hierarchy
+                ]
+
+            self._coarsening_resume_used = True
+            self._coarsening_resume_level = _start_level
+            self._coarsening_resume_terminal = _resume_terminal
+            self._coarsening_resume_terminal_reason = _resume_terminal_reason
+        else:
+            _resume_terminal = False
+            _resume_terminal_reason = None
+            self._coarsening_resume_used = False
+            self._coarsening_resume_level = None
+            self._coarsening_resume_terminal = False
+            self._coarsening_resume_terminal_reason = None
+
+        # A prefix's numeric level is the number of completed rounds.
+        # A terminal prefix is already the algorithmically final pre-post-
+        # sparsification state, even when the caller requested more levels.
+        _stop_level = (
+            _start_level
+            if _resume_terminal
+            else self.coarsen_levels
+        )
+        for level in range(_start_level, _stop_level):
             if self.verbose:
                 print(f"  Level {level+1}: {current_n_nodes:,} nodes")
 
@@ -1155,6 +1811,21 @@ class OptimizedCommunityAnalyzer:
                 current_weights = current_distances = np.empty(0, np.float32)
                 cumulative_mapping = meta_id[cumulative_mapping]
                 current_n_nodes = int(n_meta)
+                self._save_coarsening_stack_level(
+                    level=level + 1,
+                    level_kind="coarsening_prefix",
+                    n_nodes=current_n_nodes,
+                    sources=current_sources,
+                    targets=current_targets,
+                    distances=current_distances,
+                    weights=current_weights,
+                    cumulative_mapping=cumulative_mapping,
+                    local_mapping=meta_id,
+                    k_prev=k_prev,
+                    reduction_ratio=ratio,
+                    terminal=True,
+                    terminal_reason="no_edges_survive",
+                )
                 self._similarity_cache.clear()
                 gc.collect()
                 break
@@ -1164,6 +1835,17 @@ class OptimizedCommunityAnalyzer:
 
             # Choose aggregation path
             need_early_stop = (n_meta < 1000) or (ratio > 0.95)
+            if n_meta < 1000 and ratio > 0.95:
+                terminal_reason = (
+                    "n_meta_below_1000_and_"
+                    "reduction_ratio_above_0.95"
+                )
+            elif n_meta < 1000:
+                terminal_reason = "n_meta_below_1000"
+            elif ratio > 0.95:
+                terminal_reason = "reduction_ratio_above_0.95"
+            else:
+                terminal_reason = None
             if True and (need_early_stop or ms.size > MAX_AGG_EDGES): # TURN ON CHUNKING IF NEEDED
                 a, b, w, d = aggregate_undirected_edges_with_dist_chunked(ms, mt, mw, md, chunk=CHUNK)
             else:
@@ -1183,6 +1865,21 @@ class OptimizedCommunityAnalyzer:
             current_n_nodes = int(n_meta)
             current_sources, current_targets = a, b
             current_weights, current_distances = w, d
+            self._save_coarsening_stack_level(
+                level=level + 1,
+                level_kind="coarsening_prefix",
+                n_nodes=current_n_nodes,
+                sources=current_sources,
+                targets=current_targets,
+                distances=current_distances,
+                weights=current_weights,
+                cumulative_mapping=cumulative_mapping,
+                local_mapping=meta_id,
+                k_prev=k_prev,
+                reduction_ratio=ratio,
+                terminal=need_early_stop,
+                terminal_reason=terminal_reason,
+            )
 
             if self.verbose:
                 avg_deg = (2 * len(a)) / max(1, n_meta)
@@ -1744,9 +2441,12 @@ class OptimizedCommunityAnalyzer:
                    normalize_rank_stat: bool = True,
                    reassign_pruned: bool = False,
                    output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
-        """Run CSR-native Leiden on a symmetric CSR built DIRECTLY from unique undirected pairs (a<b).
-        No COO conversions, no array mirroring. Optional warm-start projection supported (projection only;
-        sknetwork.Leiden doesn't accept an initial partition at fit time).
+        """Run CSR-native Leiden on a symmetric CSR built from unique pairs.
+
+        Optional warm-start labels are shape-checked and projected to the coarse
+        graph when needed, but they are not passed into installed scikit-network
+        0.33.0 because its public ``Leiden.fit`` API does not expose initial
+        assignments. True CSR-native warm starts require upstream API support.
         """
         try:
             _prepare_threads_for_sknetwork()
@@ -2082,6 +2782,7 @@ class OptimizedCommunityAnalyzer:
 
         # Helper to (re)assign one node from neighbors
         def _assign_from_neighbors(idx) -> bool:
+            """Assign one pruned node from the strongest labeled neighbor."""
             start = self.csr_offsets[idx]
             end = self.csr_offsets[idx + 1]
             if start == end:
@@ -2151,68 +2852,223 @@ class OptimizedCommunityAnalyzer:
         """Identify interface edges between communities."""
         if self.verbose:
             print(f"Identifying interface edges...")
-        
-        # Get cluster assignments
+
         clusters = df[cluster_col].values
-        
-        # Use full graph for interface detection
         sources = self.full_sources
         targets = self.full_targets
         distances = self.full_distances
-        
-        # Calculate similarities for analysis
-        similarities = self._compute_similarities(distances, scale)
-        
-        # Convert pruned_clusters to array
-        pruned_clusters_array = np.array(list(pruned_clusters), dtype=np.int64)
-        
-        # Run interface detection with detailed info
-        (is_interface, edge_types, source_clusters, target_clusters, 
-        interface_count, cross_count, pruned_count) = identify_interface_edges_detailed(
-            sources, targets, distances, similarities, 
-            clusters, pruned_clusters_array
+
+        pruned_clusters_array = np.array(
+            list(pruned_clusters),
+            dtype=np.int64,
         )
-        
-        # Get indices of interface edges
-        interface_indices = np.where(is_interface)[0]
-        
+
+        # Preserve exact legacy semantics for custom similarity functions.
+        # The bounded fast path is behaviorally proven for default Gaussian.
+        if getattr(self, "_similarity_cache_identity", None) != "default_gaussian":
+            similarities = self._compute_similarities(distances, scale)
+
+            (
+                is_interface,
+                edge_types,
+                source_clusters,
+                target_clusters,
+                interface_count,
+                cross_count,
+                pruned_count,
+            ) = identify_interface_edges_detailed(
+                sources,
+                targets,
+                distances,
+                similarities,
+                clusters,
+                pruned_clusters_array,
+            )
+
+            interface_indices = np.where(is_interface)[0]
+
+            if self.verbose:
+                print(f"Found {interface_count} interface edges:")
+                print(f"  - {cross_count} cross-community edges")
+                print(f"  - {pruned_count} edges in pruned communities")
+
+            if len(interface_indices) > 0:
+                interface_sources = sources[interface_indices]
+                interface_targets = targets[interface_indices]
+                interface_distances = distances[interface_indices]
+                interface_similarities = similarities[interface_indices]
+                interface_source_clusters = source_clusters[interface_indices]
+                interface_target_clusters = target_clusters[interface_indices]
+                interface_edge_types = edge_types[interface_indices]
+
+                edge_type_map = {
+                    0: "cross_community",
+                    1: "pruned_community",
+                }
+                edge_type_strings = [
+                    edge_type_map[t]
+                    for t in interface_edge_types
+                ]
+
+                return pd.DataFrame({
+                    "source": interface_sources,
+                    "target": interface_targets,
+                    "distance": interface_distances,
+                    "similarity": interface_similarities,
+                    "source_cluster": interface_source_clusters,
+                    "target_cluster": interface_target_clusters,
+                    "edge_type": edge_type_strings,
+                })
+
+            return pd.DataFrame(columns=[
+                "source",
+                "target",
+                "distance",
+                "similarity",
+                "source_cluster",
+                "target_cluster",
+                "edge_type",
+            ])
+
+        max_pruned = 0
+        for c in pruned_clusters_array:
+            if c > max_pruned:
+                max_pruned = int(c)
+
+        is_pruned = np.zeros(
+            max_pruned + 1,
+            dtype=np.bool_,
+        )
+        for c in pruned_clusters_array:
+            is_pruned[c] = True
+
+        chunk_size = 1_000_000
+
+        interface_count = 0
+        cross_count = 0
+        pruned_count = 0
+
+        # Pass 1: count only. No full mask/similarity/index arrays.
+        for start in range(0, len(sources), chunk_size):
+            stop = min(start + chunk_size, len(sources))
+
+            ni, nc, np_ = _count_interface_edges_materialize_fast(
+                sources[start:stop],
+                targets[start:stop],
+                clusters,
+                is_pruned,
+                max_pruned,
+            )
+
+            interface_count += int(ni)
+            cross_count += int(nc)
+            pruned_count += int(np_)
+
         if self.verbose:
             print(f"Found {interface_count} interface edges:")
             print(f"  - {cross_count} cross-community edges")
             print(f"  - {pruned_count} edges in pruned communities")
-        
-        if len(interface_indices) > 0:
-            # Extract data for interface edges only
-            interface_sources = sources[interface_indices]
-            interface_targets = targets[interface_indices]
-            interface_distances = distances[interface_indices]
-            interface_similarities = similarities[interface_indices]
-            interface_source_clusters = source_clusters[interface_indices]
-            interface_target_clusters = target_clusters[interface_indices]
-            interface_edge_types = edge_types[interface_indices]
-            
-            # Convert edge type codes to strings
-            edge_type_map = {0: "cross_community", 1: "pruned_community"}
-            edge_type_strings = [edge_type_map[t] for t in interface_edge_types]
-            
-            # Create DataFrame
-            interface_edges_df = pd.DataFrame({
-                'source': interface_sources,
-                'target': interface_targets,
-                'distance': interface_distances,
-                'similarity': interface_similarities,
-                'source_cluster': interface_source_clusters,
-                'target_cluster': interface_target_clusters,
-                'edge_type': edge_type_strings
-            })
-        else:
-            # Empty DataFrame
-            interface_edges_df = pd.DataFrame(columns=[
-                'source', 'target', 'distance', 'similarity', 
-                'source_cluster', 'target_cluster', 'edge_type'
+
+        if interface_count == 0:
+            return pd.DataFrame(columns=[
+                "source",
+                "target",
+                "distance",
+                "similarity",
+                "source_cluster",
+                "target_cluster",
+                "edge_type",
             ])
-        
-        return interface_edges_df
+
+        interface_sources = np.empty(
+            interface_count,
+            dtype=sources.dtype,
+        )
+        interface_targets = np.empty(
+            interface_count,
+            dtype=targets.dtype,
+        )
+        interface_distances = np.empty(
+            interface_count,
+            dtype=distances.dtype,
+        )
+        interface_source_clusters = np.empty(
+            interface_count,
+            dtype=np.int64,
+        )
+        interface_target_clusters = np.empty(
+            interface_count,
+            dtype=np.int64,
+        )
+        interface_edge_types = np.empty(
+            interface_count,
+            dtype=np.int8,
+        )
+
+        # Pass 2: fill only requested interface rows in original edge order.
+        offset = 0
+
+        for start in range(0, len(sources), chunk_size):
+            stop = min(start + chunk_size, len(sources))
+
+            offset = _fill_interface_edges_materialize_fast(
+                sources[start:stop],
+                targets[start:stop],
+                distances[start:stop],
+                clusters,
+                is_pruned,
+                max_pruned,
+                interface_sources,
+                interface_targets,
+                interface_distances,
+                interface_source_clusters,
+                interface_target_clusters,
+                interface_edge_types,
+                offset,
+            )
+
+        if offset != interface_count:
+            raise RuntimeError(
+                "Interface materialization count mismatch: "
+                f"{offset} != {interface_count}"
+            )
+
+        # Preserve the original full-distance adaptive calibration.
+        if (
+            scale is None
+            or (isinstance(scale, str) and scale == "adaptive")
+        ):
+            similarity_scale = _get_adaptive_similarity_scale_fast(
+                self,
+                distances,
+            )
+        else:
+            similarity_scale = scale
+
+        interface_similarities = self.similarity_function(
+            interface_distances,
+            similarity_scale,
+        )
+
+        edge_type_map = {
+            0: "cross_community",
+            1: "pruned_community",
+        }
+        edge_type_strings = [
+            edge_type_map[t]
+            for t in interface_edge_types
+        ]
+
+        return pd.DataFrame({
+            "source": interface_sources,
+            "target": interface_targets,
+            "distance": interface_distances,
+            "similarity": interface_similarities,
+            "source_cluster": interface_source_clusters,
+            "target_cluster": interface_target_clusters,
+            "edge_type": edge_type_strings,
+        })
+
     
     def extract_interface_edges(self, labels: np.ndarray) -> Dict[str, Any]:
         """Extract interface edges efficiently."""
@@ -2809,7 +3665,7 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
                              scale, min_cluster_size, rank_stat_col, 
                              prev_labels=None, warm_start=True,
                              save_outputs=True, algorithm="leiden"):
-    """Process a single resolution value."""
+    """Run one community-detection resolution and optionally save outputs."""
     if prev_labels is not None and warm_start:
         # Warm-start from previous resolution
         initial_membership = prev_labels
@@ -2945,13 +3801,17 @@ def process_resolution_shared(resolution, shared_data, output_dir, run_name,
     
     # Create mini graph loader
     class MiniLoader:
+        """Loader shim used by multiprocessing shared-data workers."""
+
         def __init__(self):
+            """Attach preloaded dataframe and edge arrays to the loader API."""
             self.node_df = node_df
             self.n_nodes = shared_data['n_nodes']
             self._edge_arrays = (sources, targets, distances)
         
         @property
         def edge_arrays(self):
+            """Return shared worker edge arrays as ``(sources, targets, distances)``."""
             return self._edge_arrays
     
     # Create analyzer
@@ -3178,6 +4038,7 @@ def main(location, output_dir, run_name, resolutions, similarity_scale,
                 
                 # Define worker function for independent processing
                 def independent_worker(resolution):
+                    """Process one resolution in a worker-owned analyzer."""
                     # Load graph
                     loader = OptimizedGraphLoader(location)
                     

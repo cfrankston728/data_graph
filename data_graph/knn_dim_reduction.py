@@ -1,4 +1,9 @@
-# data_graph/knn_dim_reduction.py
+"""Dimensionality-reduction helpers for KNN neighbor discovery.
+
+The reduced arrays produced here are used only to choose candidate neighbors for
+graph construction. Final edge weights can still be computed from the original
+feature matrix by ``DataGraphGenerator`` depending on ``knn_weights_from``.
+"""
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, Dict, Any
@@ -21,6 +26,7 @@ class KNNReductionConfig:
     cast_float32: bool = True
 
 def _auto_ipca_batch_size(n: int, d: int) -> int:
+    """Choose an IncrementalPCA batch size from array shape and a memory cap."""
     # ~200MB cap in float32
     target_bytes = 200_000_000
     per_row = d * 4
@@ -29,6 +35,7 @@ def _auto_ipca_batch_size(n: int, d: int) -> int:
     return int(max(512, 2**int(np.round(np.log2(bs)))))
 
 def _estimate_n_for_var(Xs: np.ndarray, var: float, random_state: int) -> int:
+    """Estimate PCA components needed to retain the requested variance."""
     k_try = min(Xs.shape[1], max(8, int(0.6 * Xs.shape[1])))
     pca = PCA(n_components=k_try, svd_solver="randomized", random_state=random_state)
     pca.fit(Xs)
@@ -43,7 +50,12 @@ def reduce_for_knn(
     sample_for_var: int = 100_000
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
-    Return (X_reduced, info) for KNN neighbor *selection only*.
+    Return ``(X_reduced, info)`` for KNN neighbor *selection only*.
+
+    ``cfg.method`` may request PCA, IncrementalPCA, truncated SVD, Gaussian
+    random projection, sparse random projection, or no reduction. The returned
+    metadata records the effective method and output dimensionality so saved
+    DataGraph metadata can explain how the KNN candidate graph was formed.
     """
     if cfg is None or cfg.method == "none":
         Y = X.astype(np.float32) if (cfg and cfg.cast_float32) else X
