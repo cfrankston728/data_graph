@@ -23,7 +23,7 @@ A Python library for creating and refining sparse graphs from data using custom 
 * [Performance Tips](#performance-tips)
 * [Benchmarking & Timing](#benchmarking--timing)
 
-  * [End-to-End Pipeline](#endtoend-pipeline)
+  * [End-to-End Pipeline (2M scMicroC models)](#endtoend-pipeline-2m-scmicroc-models)
   * [Example: Large-Scale Run Log](#example-largescale-run-log)
   * [Timing Summary (parsed)](#timing-summary-parsed)
   * [Interpreting the Numbers](#interpreting-the-numbers)
@@ -304,10 +304,18 @@ graph_obj, results = generator.build_and_refine_graph(
 
 ## Benchmarking & Timing
 
-### End-to-End Pipeline
+### End-to-End Pipeline (2M scMicroC models)
 
-Rough wall-clock times observed on a ~2M-item graph, provided for planning/ballparking:
+Rough wall-clock times observed on a ~2M-item scMicroC dataset (10kbp scHiC + scRNA), provided for planning/ballparking:
 
+* **Data prep**
+
+  * Imputations (10kbp scHiC + scRNA): ~**6 hours**
+  * Submatrix extractions (independent of imputation): ~**1 hour**
+* **Modeling**
+
+  * VAE training (~50 epochs, batch 512): ~**5–6 hours**
+  * Full dataset encodings: ~**1–2 hours** *(can be faster with larger batch size)*
 * **Graph**
 
   * Build data graph: ~**10–30 minutes** *(~10 min with no QC/polishing)*

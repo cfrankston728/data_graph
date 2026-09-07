@@ -407,22 +407,28 @@ def extract_upper_triangle_edges_from_csr_numba(indptr, indices, data, n):
     Numba-accelerated extraction of upper-triangle edges from CSR.
     Returns (rows, cols, weights) as numpy arrays.
     """
-    # Count edges first
-    edge_count = 0
-    for i in range(n):
+    counts = np.zeros(n, dtype=np.int64)
+
+    for i in prange(n):
+        row_count = 0
         for j_idx in range(indptr[i], indptr[i+1]):
             j = indices[j_idx]
             if i < j:
-                edge_count += 1
-    
-    # Allocate output arrays
+                row_count += 1
+        counts[i] = row_count
+
+    positions = np.empty(n, dtype=np.int64)
+    edge_count = 0
+    for i in range(n):
+        positions[i] = edge_count
+        edge_count += counts[i]
+
     rows = np.empty(edge_count, dtype=np.int32)
     cols = np.empty(edge_count, dtype=np.int32)
     weights = np.empty(edge_count, dtype=data.dtype)
-    
-    # Fill arrays in parallel
-    edge_idx = 0
-    for i in range(n):
+
+    for i in prange(n):
+        edge_idx = positions[i]
         for j_idx in range(indptr[i], indptr[i+1]):
             j = indices[j_idx]
             if i < j:
@@ -430,7 +436,7 @@ def extract_upper_triangle_edges_from_csr_numba(indptr, indices, data, n):
                 cols[edge_idx] = j
                 weights[edge_idx] = data[j_idx]
                 edge_idx += 1
-                
+
     return rows, cols, weights
 
 def extract_upper_triangle_edges_from_csr(graph):

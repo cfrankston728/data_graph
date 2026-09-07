@@ -38,3 +38,30 @@ __all__ = [
 # Package metadata
 __version__ = '1.0.0'
 __author__ = 'Connor Frankston'
+
+
+# R189 consolidated public community API
+from .community_api import (
+    CommunityResult,
+    SampledCommunityResult,
+    community_backend_status,
+    run_communities,
+    run_sampled_communities,
+)
+
+try:
+    __all__
+except NameError:
+    __all__ = []
+
+for _community_api_name in (
+    "CommunityResult",
+    "SampledCommunityResult",
+    "community_backend_status",
+    "run_communities",
+    "run_sampled_communities",
+):
+    if _community_api_name not in __all__:
+        __all__.append(_community_api_name)
+
+del _community_api_name

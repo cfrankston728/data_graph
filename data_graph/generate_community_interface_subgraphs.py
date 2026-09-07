@@ -2440,144 +2440,280 @@ class OptimizedCommunityAnalyzer:
                    knee_sensitivity: float = 1.0,
                    normalize_rank_stat: bool = True,
                    reassign_pruned: bool = False,
-                   output_prefix: Optional[str] = None) -> Tuple[pd.DataFrame, np.ndarray]:
-        """Run CSR-native Leiden on a symmetric CSR built from unique pairs.
+                   output_prefix: Optional[str] = None,
+                   community_backend: str = 'cpu_lean_leiden') -> Tuple[pd.DataFrame, np.ndarray]:
+        """Run project-owned Leiden through the consolidated community runtime.
 
-        Optional warm-start labels are shape-checked and projected to the coarse
-        graph when needed, but they are not passed into installed scikit-network
-        0.33.0 because its public ``Leiden.fit`` API does not expose initial
-        assignments. True CSR-native warm starts require upstream API support.
+        The consolidated path operates directly on the loader's original CSR
+        when available. It does not reconstruct an already-symmetric graph
+        from COO edge arrays, does not perform historical pre-Leiden
+        sparsification/coarsening, and honors the requested similarity scale.
+
+        The public analyzer contract and downstream dataframe/statistics/
+        interface-edge outputs remain unchanged.
         """
         try:
             _prepare_threads_for_sknetwork()
-            from sknetwork.clustering import Leiden
-        except ImportError:
-            raise ImportError("Install scikit-network: pip install scikit-network")
 
-        # Ensure CSR structures (offsets/indices) cached if you use them elsewhere
-        if not self._csr_built:
-            self._ensure_csr_built()
+            from data_graph.community_runtime import (
+                distance_csr_from_loader,
+                run_distance_graph_communities,
+            )
+            from data_graph.community_backends import (
+                get_community_backend,
+            )
 
-        # Ensure sparsify/coarsen has been executed
-        if not self._graph_prepared:
-            self._ensure_prepared()
-            self._initialized = True
+        except ImportError as exc:
+            raise ImportError(
+                "Consolidated project-local community runtime is unavailable."
+            ) from exc
 
-        # Names
+        backend_impl = get_community_backend(
+            str(community_backend)
+        )
+
+        community_backend = (
+            backend_impl
+            .capabilities
+            .name
+        )
+
         if run_id is None:
             run_id = f"leiden_res{resolution:.3f}"
+
         if output_prefix is None:
             output_prefix = f"leiden_{run_id}_"
 
         if self.verbose:
-            print(f"\n--- Building csr from undirected edges ---")
-        with perf_monitor.timed_operation(f"\n--- Building csr from undirected edges ---"):
-            # We have UNIQUE undirected pairs (a<b). Build symmetric CSR without COO.
-            a = self.coarsened_sources.astype(np.int32,  copy=False)
-            b = self.coarsened_targets.astype(np.int32,  copy=False)
-            w = self.coarsened_weights.astype(np.float32, copy=False)
-            n = int(self.n_nodes_final)
+            print(
+                "\n--- Loading full unsparsified distance CSR for "
+                "consolidated Leiden runtime ---"
+            )
 
-            csr = _csr_from_undirected_edges(a, b, w, n)
+        with perf_monitor.timed_operation(
+            "\n--- Load full unsparsified CSR for Leiden ---"
+        ):
+            distance_csr = (
+                distance_csr_from_loader(
+                    self.loader
+                )
+            )
 
-            # Hygiene for sknetwork internals: sorted indices + float32 data avoids hidden copies
-            # (sknetwork casts to float32 internally anyway).
-            if hasattr(csr, "has_sorted_indices"):
-                if not csr.has_sorted_indices:
-                    csr.sort_indices()
-            else:
-                csr.sort_indices()
-            if csr.data.dtype != np.float32:
-                csr.data = csr.data.astype(np.float32, copy=False)
+            n = int(
+                self.loader.n_nodes
+            )
 
-        if self.verbose:
-            print(f"\n--- Running CSR-native Leiden with resolution={resolution} ---")
+            if (
+                distance_csr.shape
+                != (n, n)
+            ):
+                raise ValueError(
+                    "Full distance CSR has shape "
+                    f"{distance_csr.shape}, expected ({n}, {n})."
+                )
 
-        with perf_monitor.timed_operation(f"Leiden clustering (res={resolution})"):
-            # Warm start projection (fine -> coarse) if provided; note: not passed to Leiden
+            if (
+                distance_csr.data.dtype
+                != np.float32
+            ):
+                distance_csr.data = (
+                    distance_csr.data.astype(
+                        np.float32,
+                        copy=False,
+                    )
+                )
+
             if initial_membership is not None:
-                if self.coarsened and initial_membership.shape[0] == self.loader.n_nodes:
-                    initial_membership = self._project_labels_to_coarse_mode(initial_membership)
-                elif initial_membership.shape[0] != n:
+                initial_membership = np.asarray(
+                    initial_membership
+                )
+
+                if (
+                    initial_membership.ndim != 1
+                    or initial_membership.shape[0] != n
+                ):
                     raise ValueError(
-                        f"initial_membership has length {initial_membership.shape[0]}, expected "
-                        f"{self.loader.n_nodes} (fine) or {n} (coarse)."
+                        "initial_membership has shape "
+                        f"{initial_membership.shape}, expected ({n},). "
+                        "The consolidated leiden_csr path operates on "
+                        "the full graph and does not accept legacy "
+                        "coarsened memberships."
                     )
 
-            process = psutil.Process()
-            print(f"Memory before Leiden: {process.memory_info().rss / 1e9:.2f} GB")
-            print(f"Available memory: {psutil.virtual_memory().available / 1e9:.2f} GB")
-
-            # Construct Leiden (lean outputs, stable iteration; keep verbose to see aggregation/gain logs)
-            leiden = Leiden(
-                resolution=float(resolution),
-                modularity='newman',         # fine for undirected
-                return_probs=False,          # avoid building membership/prob matrix
-                return_aggregate=False,      # don't store coarse graph
-                tol_optimization=1e-3,
-                tol_aggregation=1e-3,        # raise to 1e-2 if any γ shows many tiny-gain levels
-                n_aggregations=50,           # safety cap for pathological chains
-                shuffle_nodes=False,         # less run-to-run variance
-                random_state=42,             # deterministic
-                verbose=False                 # prints "Aggregation: ..., Increase: ..."
+        if self.verbose:
+            print(
+                "\n--- Running consolidated project-owned CSR Leiden "
+                f"with resolution={resolution}, scale={scale} ---"
             )
 
-            print(f"Constructed Leiden object; starting fit_predict...")
+        with perf_monitor.timed_operation(
+            f"Leiden clustering (res={resolution})"
+        ):
+            process = psutil.Process()
 
-            # >>> Use fit_predict (labels only) instead of fit_transform (which builds membership)
-            labels = leiden.fit_predict(csr).astype(np.int32, copy=False)
+            print(
+                "Memory before Leiden: "
+                f"{process.memory_info().rss / 1e9:.2f} GB"
+            )
 
-            print(f"Memory after Leiden: {process.memory_info().rss / 1e9:.2f} GB")
+            print(
+                "Available memory: "
+                f"{psutil.virtual_memory().available / 1e9:.2f} GB"
+            )
 
-            if labels.ndim != 1 or labels.shape[0] != n:
-                raise ValueError(f"Leiden labels have wrong shape {labels.shape}")
+            labels, _weighted_csr = (
+                run_distance_graph_communities(
+                    distance_csr,
+                    resolution=float(
+                        resolution
+                    ),
+                    scale=scale,
+                    backend=
+                        community_backend,
+                    initial_membership=
+                        initial_membership,
+                    canonicalize_warm_start=
+                        True,
+                    similarity_function=
+                        self.similarity_function,
+                )
+            )
 
-            # Project labels back to fine level if coarsened
-            if self.coarsened:
-                full_labels = np.empty(self.loader.n_nodes, dtype=np.int32)
-                # meta_id maps fine node -> coarse node id
-                for i in range(self.loader.n_nodes):
-                    full_labels[i] = labels[self.meta_id[i]]
-                labels = full_labels
+            labels = np.asarray(
+                labels,
+                dtype=np.int32,
+            )
+
+            print(
+                "Memory after Leiden: "
+                f"{process.memory_info().rss / 1e9:.2f} GB"
+            )
+
+            if (
+                labels.ndim != 1
+                or labels.shape[0] != n
+            ):
+                raise ValueError(
+                    f"Leiden labels have wrong shape {labels.shape}"
+                )
 
             if self.verbose:
-                n_clusters = int(np.unique(labels).size)
-                print(f"Found {n_clusters} communities")
+                n_clusters = int(
+                    np.unique(
+                        labels
+                    ).size
+                )
 
-        # ---- Post-processing (unchanged) ----
-        with perf_monitor.timed_operation("Process cluster labels"):
+                print(
+                    f"Found {n_clusters} communities"
+                )
+
+        # ---- Existing downstream contracts retained ----
+        with perf_monitor.timed_operation(
+            "Process cluster labels"
+        ):
             df = self.loader.node_df.copy()
-            cluster_col = f'{output_prefix}cluster'
-            rank_col    = f'{output_prefix}rank'
+
+            cluster_col = (
+                f'{output_prefix}cluster'
+            )
+
+            rank_col = (
+                f'{output_prefix}rank'
+            )
+
             df[cluster_col] = labels
 
-        with perf_monitor.timed_operation("Process cluster statistics"):
-            cluster_stats, pruning_info = self._process_cluster_stats(
-                df, labels, cluster_col, rank_col, rank_stat_col,
-                normalize_rank_stat, prune_small_clusters,
-                min_cluster_size, knee_sensitivity, reassign_pruned
+        with perf_monitor.timed_operation(
+            "Process cluster statistics"
+        ):
+            cluster_stats, pruning_info = (
+                self._process_cluster_stats(
+                    df,
+                    labels,
+                    cluster_col,
+                    rank_col,
+                    rank_stat_col,
+                    normalize_rank_stat,
+                    prune_small_clusters,
+                    min_cluster_size,
+                    knee_sensitivity,
+                    reassign_pruned,
+                )
             )
 
-        with perf_monitor.timed_operation("Identify interface edges"):
-            interface_edges_df = self._identify_interface_edges(
-                df, cluster_col, pruning_info.get('pruned_clusters', []), scale
+        with perf_monitor.timed_operation(
+            "Identify interface edges"
+        ):
+            interface_edges_df = (
+                self._identify_interface_edges(
+                    df,
+                    cluster_col,
+                    pruning_info.get(
+                        'pruned_clusters',
+                        [],
+                    ),
+                    scale,
+                )
             )
 
-        with perf_monitor.timed_operation("Store run results"):
+        with perf_monitor.timed_operation(
+            "Store run results"
+        ):
             self.runs[run_id] = {
-                'df': df,
-                'cluster_stats': cluster_stats,
-                'pruning_info': pruning_info,
-                'resolution': resolution,
-                'cluster_col': cluster_col,
-                'rank_col': rank_col,
-                'similarity_scale': scale,
-                'labels': labels,
-                'coarsened': self.coarsened,
-                'coarsening_ratio': getattr(self, 'coarsening_ratio', None),
-                'algorithm': 'leiden_csr'
+                'df':
+                    df,
+
+                'cluster_stats':
+                    cluster_stats,
+
+                'pruning_info':
+                    pruning_info,
+
+                'resolution':
+                    resolution,
+
+                'cluster_col':
+                    cluster_col,
+
+                'rank_col':
+                    rank_col,
+
+                'similarity_scale':
+                    scale,
+
+                'labels':
+                    labels,
+
+                'coarsened':
+                    False,
+
+                'coarsening_ratio':
+                    None,
+
+                'algorithm':
+                    'leiden_csr',
+
+                'leiden_runtime':
+                    (
+                        'project_owned_lean_leiden'
+                        if community_backend == 'cpu_lean_leiden'
+                        else community_backend
+                    ),
+
+                'community_backend':
+                    community_backend,
+
+                'pre_leiden_sparsification':
+                    False,
+
+                'pre_leiden_coarsening':
+                    False,
             }
-            self.interface_edges[run_id] = interface_edges_df
+
+            self.interface_edges[
+                run_id
+            ] = interface_edges_df
 
         return cluster_stats, labels
 
@@ -3664,8 +3800,33 @@ def load_interface_edges(output_dir, run_id):
 def process_single_resolution(resolution, analyzer, output_dir, run_name, 
                              scale, min_cluster_size, rank_stat_col, 
                              prev_labels=None, warm_start=True,
-                             save_outputs=True, algorithm="leiden"):
+                             save_outputs=True, algorithm="leiden", community_backend=None):
     """Run one community-detection resolution and optionally save outputs."""
+    algorithm_key = str(algorithm).lower()
+
+    # Historical compatibility: the public default has long been "leiden"
+    # even though the implementation branches named the CSR variant
+    # "leiden_csr".
+    if algorithm_key == "leiden":
+        algorithm_key = "leiden_csr"
+
+    if (
+        community_backend is not None
+        and algorithm_key != "leiden_csr"
+    ):
+        raise ValueError(
+            "community_backend is only valid with "
+            "algorithm='leiden' or algorithm='leiden_csr'; "
+            f"received algorithm={algorithm!r}, "
+            f"community_backend={community_backend!r}"
+        )
+
+    selected_backend = (
+        "cpu_lean_leiden"
+        if community_backend is None
+        else str(community_backend)
+    )
+
     if prev_labels is not None and warm_start:
         # Warm-start from previous resolution
         initial_membership = prev_labels
@@ -3676,7 +3837,7 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
     run_id = f"{run_name}_res{resolution}"
     
     # Run community detection with the selected algorithm
-    if algorithm.lower() == "leiden_igraph":
+    if algorithm_key == "leiden_igraph":
         # Run Leiden community detection
         cluster_stats, labels = analyzer.run_leiden_igraph(
             resolution=resolution,
@@ -3687,7 +3848,7 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
             prune_small_clusters=True,
             min_cluster_size=min_cluster_size
         )
-    elif algorithm.lower() == "louvain_csr":
+    elif algorithm_key == "louvain_csr":
         # Run CSR-native Louvain community detection
         cluster_stats, labels = analyzer.run_louvain_csr(
             resolution=resolution,
@@ -3698,8 +3859,8 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
             prune_small_clusters=True,
             min_cluster_size=min_cluster_size
         )
-    elif algorithm.lower() == "leiden_csr":
-        # Run CSR-native Louvain community detection
+    elif algorithm_key == "leiden_csr":
+        # Consolidated CSR-Leiden family; backend selected independently.
         cluster_stats, labels = analyzer.run_leiden_csr(
             resolution=resolution,
             run_id=run_id,
@@ -3707,10 +3868,15 @@ def process_single_resolution(resolution, analyzer, output_dir, run_name,
             initial_membership=initial_membership,
             rank_stat_col=rank_stat_col,
             prune_small_clusters=True,
-            min_cluster_size=min_cluster_size
+            min_cluster_size=min_cluster_size,
+            community_backend=selected_backend,
         )
     else:
-        raise ValueError(f"Unknown algorithm: {algorithm}. Use 'leiden' or 'louvain_csr'")
+        raise ValueError(
+            f"Unknown algorithm: {algorithm}. "
+            "Use 'leiden', 'leiden_csr', "
+            "'leiden_igraph', or 'louvain_csr'"
+        )
     
     # Calculate community statistics
     analyzer.add_community_statistics(run_id)
