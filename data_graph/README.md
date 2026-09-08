@@ -22,11 +22,11 @@ A Python library for creating and refining sparse graphs from data using custom 
 * [Controlling Density](#controlling-density)
 * [Performance Tips](#performance-tips)
 * [Benchmarking & Timing](#benchmarking--timing)
-
-  * [End-to-End Pipeline (2M scMicroC models)](#endtoend-pipeline-2m-scmicroc-models)
-  * [Example: Large-Scale Run Log](#example-largescale-run-log)
-  * [Timing Summary (parsed)](#timing-summary-parsed)
-  * [Interpreting the Numbers](#interpreting-the-numbers)
+  * [Current Production Community Benchmark (2026-09-07)](#current-production-community-benchmark-2026-09-07)
+  * [Historical End-to-End Pipeline (2M scMicroC models)](#historical-end-to-end-pipeline-2m-scmicroc-models)
+  * [Historical Example: Large-Scale Run Log](#historical-example-large-scale-run-log)
+  * [Historical Timing Summary (parsed)](#historical-timing-summary-parsed)
+  * [Historical Interpretation](#historical-interpretation)
 * [Dependencies](#dependencies)
 * [License](#license)
 
@@ -65,7 +65,9 @@ pip install faiss-cpu
 pip install faiss-gpu
 ```
 
-> If FAISS is not installed, the library falls back to scikit-learn’s KNN.
+> If FAISS is unavailable or the FAISS path raises an exception, the current implementation falls back to exact scikit-learn KNN. This is convenient for smaller graphs but is a known large-scale safety risk: a FAISS failure on a multi-million-node graph should eventually fail fast rather than silently launching exact sklearn KNN.
+>
+> The production CPU community path also requires `scikit-network` and package-local native libraries. Portable native wheel/build packaging is not yet complete.
 
 ---
 
@@ -304,7 +306,42 @@ graph_obj, results = generator.build_and_refine_graph(
 
 ## Benchmarking & Timing
 
-### End-to-End Pipeline (2M scMicroC models)
+### Current Production Community Benchmark (2026-09-07)
+
+The current qualified community benchmark is distinct from the older end-to-end interface-detection timings retained below for historical context.
+
+| Stage | Qualified time |
+| --- | ---: |
+| Load full k=200 graph | **27.54 s** |
+| Convert graph distances to adaptive similarity weights | **10.98 s** |
+| Initial Newman modularity evaluation | **3.16 s** |
+| `stateful_native` full local-move convergence | **385.00 s** |
+| Final Newman modularity evaluation | **2.43 s** |
+| Remaining setup/output overhead | **~5.93 s** |
+| **Total graph-load through final modularity** | **435.04 s (~7.25 min)** |
+
+Production graph and endpoint:
+
+* **2,341,356 nodes**
+* **591,301,136 stored CSR entries**
+* k = **200**
+* resolution = **1.5**
+* initial Q = **0.6854978908320086**
+* **177 passes**
+* **1,095,310 moves**
+* **35 terminal communities**
+* final Q = **0.7366750913687556**
+* exact terminal label identity matched the previously qualified production endpoint
+
+The first local-move pass on the same production graph required **3.33 s**, performed **222,072 moves**, and reproduced the previously qualified first-pass endpoint exactly.
+
+`stateful_native` is now the implicit CPU LeanLeiden warm level-0 scheduler. Explicit `canonical`, `reactive_after_first`, `exact_dependency_skip`, and `stateful_native` scheduler selections remain available. The `gpu_cugraph_leiden` backend remains registered but is not yet production-qualified.
+
+Compared with earlier qualified full-convergence implementations, the current ~385 s mover is approximately **29.0% faster than R280**, **30.7% faster than R243**, and **40.2% faster than R226**.
+
+The following large-scale pipeline logs are retained because they document earlier graph construction, coarsening, interface extraction, and historical Leiden behavior. They should not be interpreted as the current community-runtime benchmark.
+
+### Historical End-to-End Pipeline (2M scMicroC models)
 
 Rough wall-clock times observed on a ~2M-item scMicroC dataset (10kbp scHiC + scRNA), provided for planning/ballparking:
 
@@ -330,7 +367,7 @@ Rough wall-clock times observed on a ~2M-item scMicroC dataset (10kbp scHiC + sc
 
 ---
 
-### Example: Large-Scale Run Log
+### Historical Example: Large-Scale Run Log
 
 Below is an excerpt from running the interface-detection pipeline on a graph with **2,056,772 nodes** and **330,372,002 edges** (persistent pool of 32 threads):
 
@@ -440,7 +477,7 @@ Coarsening pool closed.
 
 ---
 
-### Timing Summary (parsed)
+### Historical Timing Summary (parsed)
 
 | Operation                            | Time (s) |  Share | Calls | Avg/Call (s) |
 | ------------------------------------ | -------: | -----: | ----: | -----------: |
@@ -460,7 +497,7 @@ Coarsening pool closed.
 
 ---
 
-### Interpreting the Numbers
+### Historical Interpretation
 
 * **Leiden dominates** when run on very large graphs; consider:
 
@@ -470,9 +507,9 @@ Coarsening pool closed.
 * **I/O is small** relative to compute on SSD/NVMe (~3 min save, ~30 s load).
 * **Pre-KNN reduction** and **FAISS index choice** can cut graph build time significantly without hurting neighbor recall when tuned properly.
 
-### Bottleneck Register and Optimization Roadmap
+### Historical Bottleneck Register and Optimization Roadmap
 
-The current large-run timing profile suggests four priority areas:
+The historical large-run timing profile suggested four priority areas:
 
 | Area | Evidence in current timing | Documentation-only interpretation | Candidate follow-up |
 | ---- | -------------------------- | --------------------------------- | ------------------- |
@@ -530,6 +567,7 @@ Useful primary references for the next optimization pass:
 * `scipy`
 * `pandas`
 * `scikit-learn`
+* `scikit-network` *(required for the CPU LeanLeiden backend)*
 * `numba`
 * `faiss-cpu` or `faiss-gpu` *(optional; recommended for speed)*
 * `matplotlib` *(optional; for knee-point plots)*

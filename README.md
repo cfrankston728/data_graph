@@ -8,6 +8,28 @@ A Python library for creating and refining sparse graph representations of data 
 
 `DataGraphGenerator` builds data-driven graphs where edges represent meaningful relationships between data points. It leverages user-defined premetric weight functions and applies graph refinement techniques to produce high-quality, sparse graph representations.
 
+
+## Current Production Status
+
+The current production-qualified community path operates on the full k=200 graph through the backend-pluggable community runtime.
+
+* Production community graph: **2,341,356 nodes** and **591,301,136 stored CSR entries**
+* Production CPU backend: `cpu_lean_leiden`
+* Default warm level-0 scheduler: `stateful_native`
+* Explicit reference schedulers remain available: `canonical`, `reactive_after_first`, and `exact_dependency_skip`
+* GPU backend: `gpu_cugraph_leiden` is registered as a first-class backend but is **not yet production-qualified**
+* Qualified resolution: **1.5**
+* Initial Newman modularity: **0.6854978908320086**
+* Full convergence: **177 passes**, **1,095,310 moves**, **35 communities**
+* Final Newman modularity: **0.7366750913687556**
+* Stateful-native full-convergence optimizer: **385.00 s (~6.42 min)**
+* Graph load through final modularity evaluation: **435.04 s (~7.25 min)**
+* Qualified first local-move pass: **3.33 s**, **222,072 moves**
+
+The 385 s native full-convergence result is approximately **29.0% faster** than the earlier R280 stateful-native qualification, **30.7% faster** than the R243 exact-dependency reference, and **40.2% faster** than the older R226 canonical full-convergence implementation.
+
+Graph construction has a separate production-scale k=200 regression fixture and timing policy; see `PRODUCTION_SCALE_REGRESSION_POLICY.md`.
+
 ## Key Features
 
 * **Custom premetric** weight functions for flexible distance definitions
@@ -121,6 +143,7 @@ The library includes multiple performance optimizations:
 * `scipy`
 * `pandas`
 * `scikit-learn`
+* `scikit-network` *(required for the CPU LeanLeiden community backend)*
 * `numba`
 * `matplotlib` (optional)
 
@@ -129,6 +152,9 @@ The library includes multiple performance optimizations:
 ```bash
 pip install data-graph
 ```
+
+
+> **Production-community packaging note:** the source tree currently includes package-local Linux x86-64 native libraries used by the qualified CPU community path. Portable native wheel/build support is not yet complete, so production community execution should presently use the qualified source checkout on a compatible Linux environment.
 
 ## Advanced Usage
 
