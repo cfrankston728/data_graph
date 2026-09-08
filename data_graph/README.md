@@ -42,8 +42,10 @@ A Python library for creating and refining sparse graphs from data using custom 
 
 * **FAISS KNN backend** (CPU/GPU) with automatic fallback to scikit-learn KNN.
 * **Pre-KNN dimensionality reduction** (Incremental PCA / PCA / randomized SVD / random projection) to reduce latency and memory while preserving neighbor recall on high-D data.
-* **Configurable weight source:** compute final edge weights from the **original** high-D features or from the **embedding / reduced** representation (`knn_weights_from="original"|"embedding"`).
-* **Cleaner configuration surface:** `knn_backend="faiss"|"sklearn"`, `knn_backend_opts={...}`, and `knn_reduction=KNNReductionConfig(...)`.
+
+> **KNN backend safety:** backend selection is internal rather than a `DataGraphGenerator` constructor option. If the FAISS KNN path raises, automatic exact sklearn fallback is limited to 50,000 nodes; larger graphs fail explicitly instead of silently entering an expensive exact search. The public constructor controls `knn_reduction` and `knn_weights_from`, whose default is `"reduced"`.
+
+* **Configurable weight source:** compute final edge weights from the **original** high-D features or from the **embedding / reduced** representation (`knn_weights_from="reduced"|"original"`).
 * Numerous micro-optimizations: float32/int32 arrays, batch computations, and optional Numba-accelerated premetrics.
 
 ---
@@ -104,19 +106,12 @@ generator = DataGraphGenerator(
     premetric_weight_function=manhattan_semimetric,
     embedding_function=embed_row,
     verbose=True,
-    knn_backend="faiss",              # "faiss" or "sklearn"
-    knn_backend_opts=dict(            # forwarded to FAISS if used
-        index_factory="HNSW32,Flat",  # examples: "Flat", "IVF4096,Flat", "HNSW32,Flat"
-        metric="l2",
-        nprobe=32                     # used by IVF; ignored by HNSW/Flat
-    ),
     knn_reduction=KNNReductionConfig( # optional pre-KNN dimensionality reduction
         method="ipca",                # "ipca"|"pca"|"svd"|"rp"|"srp"
         var=0.98,                     # retain 98% variance
-        random_state=0,
         cast_float32=True
     ),
-    knn_weights_from="original"       # compute final edge weights in high-D space
+    knn_weights_from="reduced"       # use reduced-space KNN distances as edge weights
 )
 
 # 4) Build and refine the graph
@@ -159,15 +154,12 @@ DataGraphGenerator(
     premetric_weight_function,           # see signatures below
     embedding_function=None,             # row -> np.ndarray
     *,
-    knn_backend: str = "faiss",          # "faiss" | "sklearn"
-    knn_backend_opts: dict | None = None,
     knn_reduction: "KNNReductionConfig" | None = None,
-    knn_weights_from: str = "original",  # "original" | "embedding"
+    knn_weights_from: str = "reduced",   # "reduced" | "original"
     use_float32: bool = True,
     n_jobs: int = -1,                    # for sklearn backend
     plot_knee: bool = False,
     verbose: bool = True,
-    random_state: int | None = 42
 )
 ```
 
@@ -178,12 +170,6 @@ DataGraphGenerator(
 
 > `features` has shape `(n_nodes, len(feature_cols))`. Use `@njit` (Numba) for speed.
 
-**Important options:**
-
-* `knn_backend_opts` (FAISS examples)
-
-  * `index_factory`: `"Flat"`, `"IVF4096,Flat"`, `"HNSW32,Flat"`, etc.
-  * `metric`: `"l2"` (default) or `"ip"` (inner product)
   * `nprobe`: search breadth for IVF indexes (e.g., 16–256)
   * `efSearch`/`efConstruction`: HNSW tuning knobs (if applicable)
 
@@ -232,7 +218,6 @@ KNNReductionConfig(
     var: float = 0.98,        # target explained variance (0–1)
     n_components: int | None = None,  # override 'var' if set
     eps: float = 0.15,        # JL distortion for random projection auto-dim
-    random_state: int | None = 0,
     cast_float32: bool = True
 )
 ```
@@ -299,7 +284,6 @@ graph_obj, results = generator.build_and_refine_graph(
   * *HNSW:* high recall with low memory; tune `efSearch` and `M`.
 * **Use `ipca`** when `n_samples` or `n_features` is large to keep memory stable.
 * **Warm up Numba**: the first call to a JIT premetric compiles; subsequent calls are fast.
-* **Set `random_state`** for reproducibility of reduction and approximate search.
 * **Batch carefully** if you implement custom pair generation; keep arrays C-contiguous.
 
 ---
@@ -518,7 +502,8 @@ The historical large-run timing profile suggested four priority areas:
 | Pre-community sparsification/coarsening | ~102.6 s in the shown run, and recomputed for each fresh analyzer | A single analyzer prepares once, but the prepared coarsened graph is not currently persisted with the DataGraph. Repeated notebooks or fresh resolution sweeps pay this cost again. | Persist a coarsening cache keyed by base graph hash, sparsify/coarsen parameters, similarity scale, package version, and node/edge counts. Later, optionally compute this cache during graph construction. |
 | KNN graph construction | Existing build notes place full graph generation around 10-30 minutes | FAISS is already used, but the best tradeoff depends on dimension, recall target, GPU availability, and index settings. | Benchmark `ipca` vs `svd` vs `rp`/`srp`; tune IVF `nlist`/`nprobe`/train size; evaluate HNSW and GPU batch size on the exact notebook workload. |
 
-Random projection is already available through `KNNReductionConfig(method="rp")` and `KNNReductionConfig(method="srp")`. It should be treated as an experimental speed/recall preset: use fixed `random_state`, record `eps` and output dimensionality in metadata, and compare neighbor overlap plus downstream community stability against the current IPCA baseline. It may be especially useful when PCA/IPCA fitting is visible in the timing summary or when a quick KNN-search seed is sufficient before final edge weights are recomputed from the original feature space.
+
+Random projection is already available through `KNNReductionConfig(method="rp")` and `KNNReductionConfig(method="srp")`. Treat it as an experimental speed/recall preset: record `eps` and output dimensionality in metadata, and compare neighbor overlap plus downstream community stability against the current IPCA baseline. It may be useful when PCA/IPCA fitting is visible in the timing summary or when a quick KNN-search seed is sufficient before final edge weights are recomputed from the original feature space.
 
 For a persistent coarsening cache, the safest implementation path is additive:
 

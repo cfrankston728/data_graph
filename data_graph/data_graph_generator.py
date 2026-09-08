@@ -548,6 +548,31 @@ def find_2hop_neighbors_sparse(graph):
     return edge_arr
 
     
+
+
+_MAX_AUTOMATIC_EXACT_KNN_FALLBACK_NODES = 50000
+
+def _guard_automatic_exact_knn_fallback(n_nodes, error=None):
+    """Refuse accidental exact KNN fallback on large graphs."""
+    n_nodes = int(n_nodes)
+    if n_nodes <= _MAX_AUTOMATIC_EXACT_KNN_FALLBACK_NODES:
+        return
+
+    message = (
+        "FAISS KNN failed for "
+        f"{n_nodes:,} nodes; refusing automatic exact sklearn "
+        "KNN fallback above "
+        f"{_MAX_AUTOMATIC_EXACT_KNN_FALLBACK_NODES:,} nodes. "
+        "Resolve the FAISS failure or explicitly use an exact "
+        "workflow on a deliberately bounded graph."
+    )
+
+    if error is None:
+        raise RuntimeError(message)
+
+    raise RuntimeError(message) from error
+
+
 class DataGraphGenerator:
     """Build and refine sparse DataGraph objects from tabular node features.
 
@@ -1016,6 +1041,7 @@ class DataGraphGenerator:
 
         except Exception as e:
             # Hard fallback: sklearn exact
+            _guard_automatic_exact_knn_fallback(len(self.node_df), e)
             if self.verbose:
                 print(f"         [FAISS] unavailable or failed ({e}). Falling back to sklearn.kneighbors_graph exact.")
             from sklearn.neighbors import kneighbors_graph as _sk_kgraph
