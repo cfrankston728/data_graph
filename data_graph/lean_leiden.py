@@ -11,6 +11,7 @@ from scipy import sparse
 from sknetwork.clustering import Leiden
 
 from . import empty_aware_fast_local_move as _fine_move
+from . import stateful_native_local_move as _stateful_native_move
 from . import reactive_after_first_fast_local_move as _warm_reactive_move
 from . import exact_dependency_fast_local_move as _exact_dependency_move
 from . import empty_aware_selfloop_fast_local_move as _coarse_move
@@ -270,17 +271,13 @@ class LeanLeiden:
         self.verbose = bool(verbose)
 
         if warm_level0_scheduler is None:
-            warm_level0_scheduler = "canonical"
+            warm_level0_scheduler = "stateful_native"
 
         warm_level0_scheduler = str(
             warm_level0_scheduler
         ).lower()
 
-        if warm_level0_scheduler not in {
-            "canonical",
-            "reactive_after_first",
-            "exact_dependency_skip",
-        }:
+        if warm_level0_scheduler not in {'canonical', 'reactive_after_first', 'exact_dependency_skip', 'stateful_native'}:
             raise ValueError(
                 "warm_level0_scheduler must be one of "
                 "{'canonical', 'reactive_after_first', "
@@ -437,7 +434,15 @@ class LeanLeiden:
             )
 
             if level == 0:
-                if (
+                if warm_start_supplied and self.warm_level0_scheduler == "stateful_native":
+                    moved = _stateful_native_move.optimize_empty_aware_newman_result(
+                                            current_adj.indptr,
+                                            current_adj.indices,
+                                            current_adj.data,
+                                            current_labels,
+                                            self.resolution,
+                                        )
+                elif (
                     warm_start_supplied
                     and self.warm_level0_scheduler
                     == "exact_dependency_skip"

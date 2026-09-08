@@ -64,6 +64,7 @@ class LeanLeidenCPUBackend(CommunityBackend):
             "refinement_theta",
             "refinement_seed",
             "verbose",
+            "warm_level0_scheduler",
         }
 
         unknown = sorted(
@@ -108,6 +109,10 @@ class LeanLeidenCPUBackend(CommunityBackend):
                     "verbose",
                     False,
                 )
+            ),
+            warm_level0_scheduler=kwargs.get(
+                "warm_level0_scheduler",
+                None,
             ),
         )
 
